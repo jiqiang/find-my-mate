@@ -3,6 +3,10 @@
 **Status:** decision-complete (2026-09-22). There are no open questions: everything the planning effort left
 undecided is decided here.
 
+**Revised 2026-09-23:** the SDK pin moved from 54 to 57 — both stores' Expo Go builds now ship SDK 57, so the
+old pin could not be opened on an iPhone at all — and §9 gained the dev machine's WSL2 constraint. The evidence
+and the replacement rule are in §2. Nothing else in this document changed.
+
 Vocabulary is the glossary in [`CONTEXT.md`](../CONTEXT.md): **Group**, **Member**, **Owner**, **Invite code**,
 **Join request**, **Position**, **Stale**. Use those words in the code, the comments and the UI copy.
 
@@ -20,9 +24,11 @@ code, no store submission and no paid accounts.
 
 Hard constraints that shape every decision below:
 
-- **Runs in Expo Go** on real iPhones and Android phones — no development build, no TestFlight, no Play Store.
-- **Expo SDK 54 exactly.** Expo Go on the App Store stops at SDK 54; Android phones install the SDK 54 build
-  of Expo Go from expo.dev/go, because the Play Store build carries a newer SDK and refuses the project.
+- **Runs in Expo Go** on real iPhones and Android phones — no development build, no TestFlight, and no store
+  submission of this app (Expo Go itself comes from the App Store and the Play Store).
+- **Expo SDK 57 exactly.** An Expo Go build carries exactly one SDK and the project must match it, so the
+  project tracks the store builds: App Store Expo Go is 57.0.9 (released 2026-09-02) and the Play Store build
+  is 57.0.x. The current iOS build needs iOS 16.4 or newer.
 - **Foreground only.** Location is shared whenever the app is open, and only then. There is no pause, no
   incognito and no read-without-sharing mode.
 - **Free tiers only.** Firebase Spark (no Cloud Functions, no Blaze), no Apple Developer account, no Google
@@ -39,12 +45,20 @@ Hard constraints that shape every decision below:
 
 | Piece | Choice | Why |
 | --- | --- | --- |
-| App | Expo **SDK 54**, TypeScript, run in **Expo Go** | The only SDK the App Store Expo Go supports; no build step, no paid accounts. |
-| Map | **`react-native-maps` 1.20.1** (the version Expo Go SDK 54 ships), **default providers**, no API keys | Included in Expo Go on both platforms with no config. iOS draws Apple Maps, Android draws Google Maps. |
-| Location | **`expo-location`** (Expo Go SDK 54 version), foreground ("when in use") only | Included in Expo Go, no config, no key. Background location is not possible in Expo Go (§11). |
+| App | Expo **SDK 57**, TypeScript, run in **Expo Go** | The SDK both stores' Expo Go builds ship; no build step, no paid accounts. |
+| Map | **`react-native-maps` 1.27.2** (the version Expo Go SDK 57 ships), **default providers**, no API keys | Included in Expo Go on both platforms with no config. iOS draws Apple Maps, Android draws Google Maps. |
+| Location | **`expo-location` ~57.0.19** (the Expo Go SDK 57 version), foreground ("when in use") only | Included in Expo Go, no config, no key. Background location is not possible in Expo Go (§11). |
 | Backend | **Firebase JS SDK** (`firebase` package): Firestore + Anonymous Auth | The native `@react-native-firebase` SDK needs a development build; the JS SDK is the only Firebase that runs in Expo Go. |
-| Local state | **`@react-native-async-storage/async-storage`** (Expo Go version) | Holds `groupId` and the join-time `groupName`/`ownerName`, and backs Firebase Auth persistence. |
+| Local state | **`@react-native-async-storage/async-storage`** 2.2.0 (the Expo Go SDK 57 version) | Holds `groupId` and the join-time `groupName`/`ownerName`, and backs Firebase Auth persistence. |
 | Everything else | React state + Firestore snapshot listeners | No router, no state-management library, no UI kit. |
+
+**Why 57, revised 2026-09-23.** This section originally pinned SDK 54, on Expo's docs saying the App Store build
+stops there. That claim went stale: the App Store listing for Expo Go (`host.exp.Exponent`) is 57.0.9, released
+2026-09-02 — exactly the `iosClientVersion` Expo's versions API records for SDK 57, where SDK 54's is 54.0.7.
+iOS cannot install an older Expo Go (the GitHub downloads are Simulator builds), so the old pin was untestable
+on an iPhone without an Apple Developer account, which §12 rules out. The rule that replaces it: **track the
+store build.** When a store build moves past the project's SDK, upgrade the app
+(`npx expo install expo@^<sdk>.0.0 --fix`); never chase an older Expo Go.
 
 Map props: use only the surface common to both providers — `initialRegion`, `<Marker>` children,
 `showsUserLocation`, `onRegionChangeComplete`, `onPress`, `mapType: "standard"`. Do not use platform-only
@@ -525,13 +539,19 @@ No composite indexes are needed: every read is a single-document `get` or a whol
 - On the dev machine: `npx expo start`. Phones scan the QR code from Expo Go, on the same Wi-Fi by default.
 - If the phones are not on the same Wi-Fi, or the network blocks local connections:
   `npm i -g @expo/ngrok` once, then `npx expo start --tunnel`. Slower; needs internet on both sides.
-- iPhones: Expo Go from the App Store (the SDK 54 build). Android: the **SDK 54** Expo Go from expo.dev/go,
-  not the Play Store build.
+- Expo Go comes from the stores on both platforms — App Store for iPhones, Play Store for Android. Both ship
+  SDK 57 today, so nothing is sideloaded. If a store build ever moves past the project's SDK, the app is
+  upgraded to match (§2): an iPhone cannot go back to an older Expo Go.
+- **The dev machine is WSL2, so `--tunnel` is the normal path, not the fallback.** Plain `npx expo start`
+  advertises the WSL NAT address (`172.23.x.x`), which phones cannot reach; `npx expo start --tunnel` (with
+  `npm i -g @expo/ngrok` installed once) is what works. Full LAN speed needs, on the Windows side,
+  `networkingMode=mirrored` under `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`.
 - The dev machine is part of the runtime. Laptop asleep or dev server stopped means nobody can open the app.
 
 ### First time, with all four phones in the room
 
-1. With the dev machine awake and `npx expo start` running (add `--tunnel` if needed).
+1. With the dev machine awake and `npx expo start` running (`npx expo start --tunnel` on this WSL2 machine —
+   see above).
 2. Install Expo Go on each phone as above. Each phone uses its own store account; a child's iPhone may need a
    parent's approval to install.
 3. Open Expo Go and scan the QR code the dev machine shows. Allow anything Expo Go asks for to reach it.
@@ -584,7 +604,7 @@ No composite indexes are needed: every read is a single-document `get` or a whol
 
 Three things to verify before building the screens, because everything else rests on them:
 
-1. **Expo Go hello.** Create the SDK 54 Expo TypeScript app, add `react-native-maps` 1.20.1 and
+1. **Expo Go hello.** Create the SDK 57 Expo TypeScript app, add `react-native-maps` 1.27.2 and
    `expo-location`, and get the map rendering in Expo Go on one iPhone and one Android phone. This proves the
    SDK pin and the map choice before any Firebase work.
 2. **Rules in the emulator.** The rules in §4 are unexecuted. Validate at least: the create-Group batch
@@ -604,7 +624,7 @@ One consistency check to keep honest while building: nothing in this app may wri
 
 ## 11. Background location: the door v1 leaves open
 
-v1 is foreground-only because **background location cannot run in Expo Go at all**: Expo's SDK 54 docs say
+v1 is foreground-only because **background location cannot run in Expo Go at all**: Expo's SDK 57 docs say
 iOS background location "must use a development build … since it is not supported in the Expo Go app", and on
 Android "foreground and background services are not available in Expo Go". Going background later would cost
 a development build on all four phones, the iOS "Always" permission with its App Review justification,
