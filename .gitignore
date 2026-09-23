@@ -1,6 +1,7 @@
 node_modules/
 .expo/
 dist/
-.scratch/
 .env
 .env.*
+.git/
+.scratch/
