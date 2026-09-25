@@ -28,6 +28,10 @@ _Avoid_: Application, signup
 One member's whereabouts at one moment — coordinates, accuracy, and when it was last updated. Only the latest position per member exists; there are no trails.
 _Avoid_: Location, fix, ping, trail
 
+**Pin**:
+A Member's latest Position as the map shows it, labelled with their name and its age, and grey when the Member is Stale. Only Members with a Position have a pin.
+_Avoid_: Marker, dot, avatar
+
 **Stale**:
 A member whose latest position is more than three minutes old. A stale member is still a member.
 _Avoid_: Offline, disconnected, lost
