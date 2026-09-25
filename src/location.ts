@@ -1,0 +1,174 @@
+import * as Location from 'expo-location';
+import {
+  doc,
+  serverTimestamp,
+  setDoc,
+  type DocumentData,
+  type Firestore,
+  type Timestamp,
+} from 'firebase/firestore';
+
+/** Where the OS says the phone is, at one moment: the coordinates and accuracy a Position is made of. */
+export type PositionReading = { lat: number; lng: number; accuracy: number };
+
+/** A stored Position: the Member's latest whereabouts, with the server's receipt time in epoch ms. */
+export type Position = {
+  lat: number;
+  lng: number;
+  accuracy: number;
+  updatedAt: number;
+  mode: 'foreground';
+};
+
+/** The heartbeat: a JS timer, because watchPositionAsync's `timeInterval` is Android-only (spec §6). */
+export const PUBLISH_INTERVAL_MS = 30_000;
+
+/** A Member is Stale after three minutes without an update; their pin turns grey (§6). */
+export const STALE_AFTER_MS = 3 * 60_000;
+
+/** The map's age ticker: ages re-render on this beat, with no new data needed (§6). */
+export const AGE_TICK_MS = 15_000;
+
+/**
+ * Why the map is blocked: the two screens in spec §6. `granted` is the only state that shows the map,
+ * and iOS "Approximate" counts as granted — the pin is simply coarse.
+ */
+export type LocationGate = 'granted' | 'denied' | 'services-off';
+
+/**
+ * The one decision before the map is shown (spec §7.6), re-run on every return to the foreground and on
+ * Try again. The OS prompt is only ever triggered while the permission is undetermined, so it is asked once.
+ */
+export async function checkLocationGate(): Promise<LocationGate> {
+  let permission = await Location.getForegroundPermissionsAsync();
+  if (permission.status === 'undetermined') {
+    permission = await Location.requestForegroundPermissionsAsync();
+  }
+  if (permission.granted) {
+    return (await Location.hasServicesEnabledAsync()) ? 'granted' : 'services-off';
+  }
+  // Denied *and* services off is the services screen: that is the switch the phone can still act on.
+  return (await Location.hasServicesEnabledAsync()) ? 'denied' : 'services-off';
+}
+
+/**
+ * The one and only writer of a Position (spec §2): locations/{uid} inside the Group, overwritten each
+ * time, so only the latest Position per Member can exist. `updatedAt` is the server's stamp, never the
+ * phone's clock — the rules deny a phone-clock write — and `mode` is the field background tracking will
+ * extend (§11).
+ *
+ * Fire-and-forget by design: Firestore queues writes made offline and the next publish corrects the
+ * Position anyway, so there is no error UI for a failed or queued write (§6).
+ */
+export function publishLocation(db: Firestore, groupId: string, uid: string, reading: PositionReading): void {
+  void setDoc(doc(db, 'groups', groupId, 'locations', uid), {
+    lat: reading.lat,
+    lng: reading.lng,
+    accuracy: reading.accuracy,
+    updatedAt: serverTimestamp(),
+    mode: 'foreground',
+  }).catch((error: unknown) => {
+    console.warn('[location] could not publish this Position', error);
+  });
+}
+
+/**
+ * The stored Position, or null when there is none yet. A write the server has not acknowledged reads back
+ * with a null `updatedAt`; the phone's clock stands in, which §6 accepts, so the pin keeps its place
+ * instead of blinking out on every heartbeat.
+ */
+export function positionFrom(data: DocumentData | undefined, now: number): Position | null {
+  if (!data) return null;
+  const updatedAt = data.updatedAt as Timestamp | null | undefined;
+  return {
+    lat: data.lat,
+    lng: data.lng,
+    accuracy: data.accuracy,
+    updatedAt: updatedAt ? updatedAt.toMillis() : now,
+    mode: data.mode,
+  };
+}
+
+/** `{age}` on the pin: "now" under 60 s, "N min" under 60 min, "N h" under 24 h, "N d" beyond (§6). */
+export function ageLabel(updatedAt: number, now: number): string {
+  const seconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
+  if (seconds < 60) return 'now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h`;
+  return `${Math.floor(hours / 24)} d`;
+}
+
+/** More than three minutes without an update, and only then: the pin turns grey and stays on the map. */
+export function isStale(updatedAt: number, now: number): boolean {
+  return now - updatedAt > STALE_AFTER_MS;
+}
+
+/**
+ * Location sharing while the map is open. The watch and the timer are started together, and both stop on
+ * `pause()` without writing anything, which is what "backgrounding or locking the phone writes nothing"
+ * means. `resume()` watches again and publishes the held reading at once.
+ */
+export type Sharing = {
+  pause(): void;
+  resume(): Promise<void>;
+};
+
+export type SharingOptions = { db: Firestore; groupId: string; uid: string };
+
+/** Starts watching while the map is open, publishing the first reading as soon as the OS reports one. */
+export async function startSharing({ db, groupId, uid }: SharingOptions): Promise<Sharing> {
+  let latest: PositionReading | undefined;
+  let watcher: Location.LocationSubscription | undefined;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  // Bumped by every pause, so a watch that arrives after a pause removes itself instead of leaking.
+  let generation = 0;
+
+  const publish = () => {
+    if (latest) publishLocation(db, groupId, uid, latest);
+  };
+
+  const watch = async () => {
+    pause();
+    const mine = generation;
+    publish(); // The map opened, or the phone came back: the held reading goes out before any new one.
+
+    let delivered = false;
+    const started = await Location.watchPositionAsync({ accuracy: Location.Accuracy.High }, ({ coords }) => {
+      latest = {
+        lat: coords.latitude,
+        lng: coords.longitude,
+        // A null accuracy is only possible on platforms this app never runs on; §3 stores a number.
+        accuracy: coords.accuracy ?? 0,
+      };
+      if (!delivered) {
+        delivered = true; // ...so the pin lands at once rather than at the first heartbeat.
+        publish();
+      }
+    });
+
+    if (mine !== generation) {
+      started.remove();
+      return;
+    }
+    watcher = started;
+    timer = setInterval(publish, PUBLISH_INTERVAL_MS);
+  };
+
+  function pause(): void {
+    generation += 1;
+    watcher?.remove();
+    watcher = undefined;
+    if (timer) clearInterval(timer);
+    timer = undefined;
+  }
+
+  const resume = () =>
+    watch().catch((error: unknown) => {
+      console.warn('[location] could not watch this phone', error);
+    });
+
+  await resume();
+  return { pause, resume };
+}

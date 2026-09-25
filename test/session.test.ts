@@ -14,6 +14,7 @@ import {
   getDocs,
   setLogLevel,
   Timestamp,
+  updateDoc,
   type Firestore,
 } from 'firebase/firestore';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -117,10 +118,21 @@ describe('loadGroup (relaunch)', () => {
     expect(await loadGroup(as(OWNER), OWNER)).toBeNull();
   });
 
-  it('returns the stored Group with its name after Create', async () => {
+  it('returns the stored Group with its name and this phone’s name after Create', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
     // A fresh Firestore instance stands in for the relaunched app: nothing is carried over in memory.
-    expect(await loadGroup(as(OWNER), OWNER)).toEqual({ id: created.id, name: 'The Smiths' });
+    expect(await loadGroup(as(OWNER), OWNER)).toEqual({ id: created.id, name: 'The Smiths', displayName: 'Sam' });
+  });
+
+  it('takes the name off the Member document, so a rename reaches the map', async () => {
+    const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
+    await updateDoc(doc(as(OWNER), 'groups', created.id, 'members', OWNER), { displayName: 'Samantha' });
+
+    expect(await loadGroup(as(OWNER), OWNER)).toEqual({
+      id: created.id,
+      name: 'The Smiths',
+      displayName: 'Samantha',
+    });
   });
 
   it('returns null when this phone is not a Member of the stored Group', async () => {
@@ -136,10 +148,10 @@ describe('loadGroup (relaunch)', () => {
     expect(await loadGroup(as(OWNER), OWNER)).toBeNull();
   });
 
-  it('falls back to the stored Group name when offline', async () => {
+  it('falls back to the stored names when offline', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
     const offline = as(OWNER);
     await disableNetwork(offline);
-    expect(await loadGroup(offline, OWNER)).toEqual({ id: created.id, name: 'The Smiths' });
+    expect(await loadGroup(offline, OWNER)).toEqual({ id: created.id, name: 'The Smiths', displayName: 'Sam' });
   });
 });

@@ -1,5 +1,7 @@
 import { useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, TextInput, View } from 'react-native';
+
+import Button from './Button';
 
 type Props = {
   onCreate: (yourName: string, groupName: string) => Promise<void>;
@@ -73,26 +75,10 @@ function CreateForm({ onCreate }: Props) {
   );
 }
 
-function Button({ label, onPress, disabled }: { label: string; onPress: () => void; disabled?: boolean }) {
-  return (
-    <Pressable
-      accessibilityRole="button"
-      onPress={onPress}
-      disabled={disabled}
-      style={[styles.button, disabled && styles.buttonDisabled]}
-    >
-      <Text style={styles.buttonLabel}>{label}</Text>
-    </Pressable>
-  );
-}
-
 const styles = StyleSheet.create({
   screen: { flex: 1, justifyContent: 'center', padding: 24, gap: 12 },
   title: { fontSize: 28, fontWeight: '600', textAlign: 'center', marginBottom: 24 },
   input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, fontSize: 17 },
-  button: { backgroundColor: '#1a73e8', borderRadius: 8, padding: 14, alignItems: 'center' },
-  buttonDisabled: { opacity: 0.4 },
-  buttonLabel: { color: 'white', fontSize: 17, fontWeight: '600' },
   spinner: { padding: 14 },
   error: { color: '#b00020', textAlign: 'center' },
 });
