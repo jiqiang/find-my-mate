@@ -275,8 +275,9 @@ Notes the implementer should not have to rediscover:
 - **Clock skew is tolerated, deliberately.** `expiresAt` is written by the owner's phone, so a wrong clock can
   only mint a code that lives longer than 24 h. Only the Owner can create codes, they point at the Owner's own
   Group, and the code is not the gate — the approval is.
-- **The rules are unexecuted.** This is a reviewed sketch, not a tested file. Validating it in the Firestore
-  emulator, including the paths in §10, is the first task of implementation — not an open decision.
+- **The rules are executed.** `test/firestore.rules.test.ts` proves every path in §10 against the Firestore
+  emulator (`npm run test:rules`, §8). Change the rules here and in `firestore.rules` together, and keep that
+  suite green.
 - **Trust boundary.** Rules prove *who* wrote a Position and *where they were allowed to*. They never prove a
   Position is *true*: a Member can write any coordinates. Rules also cannot rate-limit or ban an abusive
   client, and cannot stop a Member copying what they are allowed to read. For four people who know each other,
@@ -526,7 +527,11 @@ Do this once, when the app is built:
    design; the security rules are what protect the data.
 8. **Commit `firestore.rules` (§4) and `firebase.json`**, and deploy with
    `firebase deploy --only firestore:rules`.
-9. **Run the rules paths in the emulator before the first phone test** (§10).
+9. **Run the rules paths in the emulator before the first phone test** (§10): `npm run test:rules`. It starts
+   the Firestore emulator under the offline `demo-find-my-mate` project, runs `test/firestore.rules.test.ts`
+   against `firestore.rules`, and shuts the emulator down. The emulator needs Java 21+; `mise.toml` pins a
+   user-local Temurin 21, so `mise install` once, then run the command from a mise-activated shell (or
+   `mise exec -- npm run test:rules`).
 
 No composite indexes are needed: every read is a single-document `get` or a whole-subcollection listener.
 

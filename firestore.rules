@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function groupPath(gid) {
+      return /databases/$(database)/documents/groups/$(gid);
+    }
+    function isMember(gid) {
+      return signedIn() && exists(/databases/$(database)/documents/groups/$(gid)/members/$(uid()));
+    }
+    function isOwner(gid) {
+      return signedIn() && get(groupPath(gid)).data.ownerUid == uid();
+    }
+    // Group creation is one batch: the group doc does not exist yet when the member write is checked.
+    function isOwnerAfter(gid) {
+      return signedIn() && getAfter(groupPath(gid)).data.ownerUid == uid();
+    }
+    function approved(gid) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/groups/$(gid)/joinRequests/$(uid()))
+        && get(/databases/$(database)/documents/groups/$(gid)/joinRequests/$(uid())).data.status == 'approved';
+    }
+    function validInvite(code, gid) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/invites/$(code))
+        && get(/databases/$(database)/documents/invites/$(code)).data.groupId == gid
+        && get(/databases/$(database)/documents/invites/$(code)).data.expiresAt > request.time;
+    }
+
+    match /groups/{gid} {
+      allow get: if isMember(gid);
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == uid()
+        && request.resource.data.maxMembers == 4
+        && request.resource.data.keys().hasOnly(['name', 'ownerUid', 'maxMembers', 'createdAt', 'activeInviteCode']);
+      // Only the name and the active code are ever editable; ownerUid and maxMembers are frozen.
+      allow update: if isOwner(gid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'activeInviteCode']);
+      allow delete: if false;                       // a group is never deleted in v1
+    }
+
+    match /groups/{gid}/members/{memberUid} {
+      allow read: if isMember(gid);
+      // The owner admits themselves in the creation batch; a joiner admits themselves only once approved.
+      allow create: if signedIn()
+        && (memberUid == uid())
+        && (
+          (request.resource.data.role == 'owner' && isOwnerAfter(gid))
+          || (request.resource.data.role == 'member' && approved(gid))
+        )
+        && request.resource.data.keys().hasOnly(['displayName', 'role', 'joinedAt']);
+      // displayName is the only field anyone can change; role and joinedAt are immutable,
+      // so a member cannot promote themselves and an owner cannot appoint a second owner.
+      allow update: if (isOwner(gid) || memberUid == uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName']);
+      // The owner cannot remove themselves: that is how "the owner cannot leave" is enforced.
+      allow delete: if isOwner(gid) && memberUid != uid();
+    }
+
+    match /groups/{gid}/joinRequests/{requestUid} {
+      allow read: if isOwner(gid) || requestUid == uid();
+      // Asking needs a live code for *this* group; approval is what grants access.
+      allow create: if requestUid == uid()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasOnly(['displayName', 'status', 'requestedAt', 'inviteCode'])
+        && validInvite(request.resource.data.inviteCode, gid);
+      // The owner approves. There is no 'denied': "Not now" writes nothing.
+      allow update: if isOwner(gid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status == 'approved';
+      allow delete: if isOwner(gid) || requestUid == uid();
+    }
+
+    match /groups/{gid}/locations/{memberUid} {
+      allow read: if isMember(gid);
+      allow create, update: if memberUid == uid()
+        && isMember(gid)
+        && request.resource.data.keys().hasOnly(['lat', 'lng', 'accuracy', 'updatedAt', 'mode'])
+        && request.resource.data.lat is number
+        && request.resource.data.lng is number
+        && request.resource.data.lat >= -90 && request.resource.data.lat <= 90
+        && request.resource.data.lng >= -180 && request.resource.data.lng <= 180
+        && request.resource.data.updatedAt == request.time     // server clock, not the phone's
+        && request.resource.data.mode == 'foreground';         // becomes hasAny(['foreground','background']) when background lands
+      allow delete: if isOwner(gid);                            // so removing a member also removes their pin
+    }
+
+    match /invites/{code} {
+      allow get: if signedIn() && (
+        resource.data.expiresAt > request.time                 // any signed-in phone with the code
+        || isOwner(resource.data.groupId)                      // the owner may read an expired one to replace it
+      );
+      allow create: if isOwner(request.resource.data.groupId)
+        && request.resource.data.keys().hasOnly(['groupId', 'groupName', 'ownerName', 'createdBy', 'expiresAt'])
+        && request.resource.data.createdBy == uid()
+        && request.resource.data.expiresAt > request.time;
+      allow update, delete: if isOwner(resource.data.groupId);
+      allow list: if false;                                     // no enumeration, ever
+    }
+  }
+}
