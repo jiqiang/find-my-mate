@@ -56,8 +56,9 @@ service cloud.firestore {
       // so a member cannot promote themselves and an owner cannot appoint a second owner.
       allow update: if (isOwner(gid) || memberUid == uid())
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName']);
+      // The owner removes anyone else; a member removes only themselves (leaving).
       // The owner cannot remove themselves: that is how "the owner cannot leave" is enforced.
-      allow delete: if isOwner(gid) && memberUid != uid();
+      allow delete: if isOwner(gid) ? memberUid != uid() : memberUid == uid();
     }
 
     match /groups/{gid}/joinRequests/{requestUid} {
@@ -85,7 +86,7 @@ service cloud.firestore {
         && request.resource.data.lng >= -180 && request.resource.data.lng <= 180
         && request.resource.data.updatedAt == request.time     // server clock, not the phone's
         && request.resource.data.mode == 'foreground';         // becomes hasAny(['foreground','background']) when background lands
-      allow delete: if isOwner(gid);                            // so removing a member also removes their pin
+      allow delete: if isOwner(gid) || memberUid == uid();      // removing or leaving also removes the pin
     }
 
     match /invites/{code} {

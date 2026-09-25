@@ -220,8 +220,9 @@ service cloud.firestore {
       // so a member cannot promote themselves and an owner cannot appoint a second owner.
       allow update: if (isOwner(gid) || memberUid == uid())
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName']);
+      // The owner removes anyone else; a member removes only themselves (leaving).
       // The owner cannot remove themselves: that is how "the owner cannot leave" is enforced.
-      allow delete: if isOwner(gid) && memberUid != uid();
+      allow delete: if isOwner(gid) ? memberUid != uid() : memberUid == uid();
     }
 
     match /groups/{gid}/joinRequests/{requestUid} {
@@ -249,7 +250,7 @@ service cloud.firestore {
         && request.resource.data.lng >= -180 && request.resource.data.lng <= 180
         && request.resource.data.updatedAt == request.time     // server clock, not the phone's
         && request.resource.data.mode == 'foreground';         // becomes hasAny(['foreground','background']) when background lands
-      allow delete: if isOwner(gid);                            // so removing a member also removes their pin
+      allow delete: if isOwner(gid) || memberUid == uid();      // removing or leaving also removes the pin
     }
 
     match /invites/{code} {
@@ -278,6 +279,9 @@ Notes the implementer should not have to rediscover:
 - **The rules are executed.** `test/firestore.rules.test.ts` proves every path in §10 against the Firestore
   emulator (`npm run test:rules`, §8). Change the rules here and in `firestore.rules` together, and keep that
   suite green.
+- **Leave, revised 2026-09-25.** The first sketch let only the Owner delete `members/{uid}` and
+  `locations/{uid}`, so a Member's own Leave batch (§5) was denied. Now a non-Owner may delete their own two
+  documents; the Owner still cannot delete their own member document.
 - **Trust boundary.** Rules prove *who* wrote a Position and *where they were allowed to*. They never prove a
   Position is *true*: a Member can write any coordinates. Rules also cannot rate-limit or ban an abusive
   client, and cannot stop a Member copying what they are allowed to read. For four people who know each other,

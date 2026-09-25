@@ -43,7 +43,18 @@ const groupRef = (db: Firestore, gid = GID) => doc(db, 'groups', gid);
 const memberRef = (db: Firestore, uid: string, gid = GID) => doc(db, 'groups', gid, 'members', uid);
 const requestRef = (db: Firestore, uid: string, gid = GID) => doc(db, 'groups', gid, 'joinRequests', uid);
 const positionRef = (db: Firestore, uid: string, gid = GID) => doc(db, 'groups', gid, 'locations', uid);
+const positionsRef = (db: Firestore, gid = GID) => collection(db, 'groups', gid, 'locations');
 const inviteRef = (db: Firestore, code: string) => doc(db, 'invites', code);
+
+const invite = (gid: string, createdBy: string, expiresAt: Timestamp) => ({
+  groupId: gid,
+  groupName: 'The Smiths',
+  ownerName: 'Sam',
+  createdBy,
+  expiresAt,
+});
+
+const memberDoc = (role: string) => ({ displayName: 'Priya', role, joinedAt: serverTimestamp() });
 
 const position = (overrides: Record<string, unknown> = {}) => ({
   lat: -33.8688,
@@ -65,23 +76,13 @@ function createGroupBatch(db: Firestore, ownerUid: string, gid = GID) {
     createdAt: serverTimestamp(),
     activeInviteCode: null,
   });
-  batch.set(memberRef(db, ownerUid, gid), {
-    displayName: 'Sam',
-    role: 'owner',
-    joinedAt: serverTimestamp(),
-  });
+  batch.set(memberRef(db, ownerUid, gid), memberDoc('owner'));
   return batch.commit();
 }
 
 async function createInvite(code: string, gid = GID, ownerUid = OWNER) {
   const db = as(ownerUid);
-  await setDoc(inviteRef(db, code), {
-    groupId: gid,
-    groupName: 'The Smiths',
-    ownerName: 'Sam',
-    createdBy: ownerUid,
-    expiresAt: Timestamp.fromMillis(Date.now() + DAY_MS),
-  });
+  await setDoc(inviteRef(db, code), invite(gid, ownerUid, Timestamp.fromMillis(Date.now() + DAY_MS)));
   await updateDoc(groupRef(db, gid), { activeInviteCode: code });
 }
 
@@ -98,12 +99,17 @@ function approve(uid: string, gid = GID) {
   return updateDoc(requestRef(as(OWNER), uid, gid), { status: 'approved' });
 }
 
-function admitSelf(uid: string, gid = GID, role = 'member') {
-  return setDoc(memberRef(as(uid), uid, gid), {
-    displayName: 'Priya',
-    role,
-    joinedAt: serverTimestamp(),
-  });
+function createOwnMember(uid: string, gid = GID, role = 'member') {
+  return setDoc(memberRef(as(uid), uid, gid), memberDoc(role));
+}
+
+// Leave and remove are the same batch; only who sends it differs.
+function removalBatch(db: Firestore, uid: string) {
+  const batch = writeBatch(db);
+  batch.delete(memberRef(db, uid));
+  batch.delete(positionRef(db, uid));
+  batch.delete(requestRef(db, uid));
+  return batch.commit();
 }
 
 // OWNER's group, with MEMBER fully admitted and a live CODE.
@@ -112,7 +118,7 @@ async function seedGroupWithMember() {
   await createInvite(CODE);
   await requestJoin(MEMBER, CODE);
   await approve(MEMBER);
-  await admitSelf(MEMBER);
+  await createOwnMember(MEMBER);
 }
 
 beforeAll(async () => {
@@ -139,9 +145,7 @@ describe('creating a Group', () => {
   });
 
   it('denies the Owner Member document on its own, without the Group in the same batch', async () => {
-    await assertFails(
-      setDoc(memberRef(as(OWNER), OWNER), { displayName: 'Sam', role: 'owner', joinedAt: serverTimestamp() }),
-    );
+    await assertFails(createOwnMember(OWNER, GID, 'owner'));
   });
 
   it('denies a non-member reading the Group', async () => {
@@ -186,13 +190,7 @@ describe('Join requests', () => {
 
   it('denies a Join request with an expired code', async () => {
     await env.withSecurityRulesDisabled(async (ctx) => {
-      await setDoc(inviteRef(modular(ctx), 'OLD001'), {
-        groupId: GID,
-        groupName: 'The Smiths',
-        ownerName: 'Sam',
-        createdBy: OWNER,
-        expiresAt: Timestamp.fromMillis(Date.now() - 60 * 1000),
-      });
+      await setDoc(inviteRef(modular(ctx), 'OLD001'), invite(GID, OWNER, Timestamp.fromMillis(Date.now() - 60 * 1000)));
     });
     await assertFails(requestJoin(JOINER, 'OLD001'));
   });
@@ -215,24 +213,24 @@ describe('admitting a Member', () => {
   });
 
   it('denies a uid with no Join request creating its Member document', async () => {
-    await assertFails(admitSelf(JOINER));
+    await assertFails(createOwnMember(JOINER));
   });
 
   it('denies a uid whose Join request is still pending creating its Member document', async () => {
     await requestJoin(JOINER, CODE);
-    await assertFails(admitSelf(JOINER));
+    await assertFails(createOwnMember(JOINER));
   });
 
   it('allows an approved uid to create its Member document', async () => {
     await requestJoin(JOINER, CODE);
     await approve(JOINER);
-    await assertSucceeds(admitSelf(JOINER));
+    await assertSucceeds(createOwnMember(JOINER));
   });
 
   it('denies an approved uid admitting itself as an Owner', async () => {
     await requestJoin(JOINER, CODE);
     await approve(JOINER);
-    await assertFails(admitSelf(JOINER, GID, 'owner'));
+    await assertFails(createOwnMember(JOINER, GID, 'owner'));
   });
 
   it('denies a joiner approving its own Join request', async () => {
@@ -246,13 +244,13 @@ describe('Positions', () => {
 
   it('lets a Member write their own Position with the server clock', async () => {
     await assertSucceeds(setDoc(positionRef(as(MEMBER), MEMBER), position()));
-    await assertSucceeds(getDocs(collection(as(OWNER), 'groups', GID, 'locations')));
+    await assertSucceeds(getDocs(positionsRef(as(OWNER))));
   });
 
   it('denies a non-member reading Positions', async () => {
     await setDoc(positionRef(as(MEMBER), MEMBER), position());
     await assertFails(getDoc(positionRef(as(STRANGER), MEMBER)));
-    await assertFails(getDocs(collection(as(STRANGER), 'groups', GID, 'locations')));
+    await assertFails(getDocs(positionsRef(as(STRANGER))));
   });
 
   it('denies a non-member writing a Position, even under their own uid', async () => {
@@ -275,26 +273,20 @@ describe('a removed Member', () => {
     await seedGroupWithMember();
     await setDoc(positionRef(as(MEMBER), MEMBER), position());
 
-    // The Owner's remove batch: Member document, Position and Join request together.
-    const db = as(OWNER);
-    const batch = writeBatch(db);
-    batch.delete(memberRef(db, MEMBER));
-    batch.delete(positionRef(db, MEMBER));
-    batch.delete(requestRef(db, MEMBER));
-    await assertSucceeds(batch.commit());
+    await assertSucceeds(removalBatch(as(OWNER), MEMBER));
   });
 
   it('cannot recreate its Member document', async () => {
-    await assertFails(admitSelf(MEMBER));
+    await assertFails(createOwnMember(MEMBER));
   });
 
   it('cannot recreate its Member document as an Owner either', async () => {
-    await assertFails(admitSelf(MEMBER, GID, 'owner'));
+    await assertFails(createOwnMember(MEMBER, GID, 'owner'));
   });
 
   it('can no longer read the Group or its Positions', async () => {
     await assertFails(getDoc(groupRef(as(MEMBER))));
-    await assertFails(getDocs(collection(as(MEMBER), 'groups', GID, 'locations')));
+    await assertFails(getDocs(positionsRef(as(MEMBER))));
   });
 
   it('cannot write a Position any more', async () => {
@@ -302,10 +294,25 @@ describe('a removed Member', () => {
   });
 });
 
-describe('the Owner', () => {
-  beforeEach(seedGroupWithMember);
+describe('leaving', () => {
+  beforeEach(async () => {
+    await seedGroupWithMember();
+    await setDoc(positionRef(as(MEMBER), MEMBER), position());
+    await setDoc(positionRef(as(OWNER), OWNER), position());
+  });
 
-  it('cannot delete their own Member document', async () => {
+  it('lets a Member leave: their Member document, Position and Join request go in one batch', async () => {
+    await assertSucceeds(removalBatch(as(MEMBER), MEMBER));
+    await assertFails(createOwnMember(MEMBER));
+  });
+
+  it('denies the Owner leaving: they cannot delete their own Member document', async () => {
     await assertFails(deleteDoc(memberRef(as(OWNER), OWNER)));
+    await assertFails(removalBatch(as(OWNER), OWNER));
+  });
+
+  it("denies a Member deleting another Member's documents", async () => {
+    await assertFails(deleteDoc(memberRef(as(MEMBER), OWNER)));
+    await assertFails(deleteDoc(positionRef(as(MEMBER), OWNER)));
   });
 });
