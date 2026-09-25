@@ -1,25 +1,29 @@
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
-import { signIn } from './src/firebase';
+import { db, signIn } from './src/firebase';
+import FirstRun from './src/screens/FirstRun';
 import Map from './src/screens/Map';
+import { createGroup, loadGroup, type Group } from './src/session';
 
-type Phase = { name: 'loading'; error?: string } | { name: 'map' };
+type Phase =
+  | { name: 'loading'; error?: string }
+  | { name: 'firstRun'; uid: string }
+  | { name: 'map'; group: Group };
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ name: 'loading' });
 
   useEffect(() => {
-    signIn().then(
-      (user) => {
-        console.log(`[auth] signed in as ${user.uid}`);
-        setPhase({ name: 'map' });
-      },
-      (error: unknown) => {
-        console.warn('[auth] sign-in failed', error);
-        setPhase({ name: 'loading', error: String(error) });
-      },
-    );
+    (async () => {
+      const user = await signIn();
+      console.log(`[auth] signed in as ${user.uid}`);
+      const group = await loadGroup(db, user.uid);
+      setPhase(group ? { name: 'map', group } : { name: 'firstRun', uid: user.uid });
+    })().catch((error: unknown) => {
+      console.warn('[app] start-up failed', error);
+      setPhase({ name: 'loading', error: String(error) });
+    });
   }, []);
 
   switch (phase.name) {
@@ -27,11 +31,20 @@ export default function App() {
       return (
         <View style={styles.centred}>
           <ActivityIndicator size="large" />
-          {phase.error && <Text style={styles.error}>Couldn't sign in: {phase.error}</Text>}
+          {phase.error && <Text style={styles.error}>Couldn't start: {phase.error}</Text>}
         </View>
       );
+    case 'firstRun':
+      return (
+        <FirstRun
+          onCreate={async (yourName, groupName) => {
+            const group = await createGroup(db, phase.uid, yourName, groupName);
+            setPhase({ name: 'map', group });
+          }}
+        />
+      );
     case 'map':
-      return <Map />;
+      return <Map groupName={phase.group.name} />;
   }
 }
 
