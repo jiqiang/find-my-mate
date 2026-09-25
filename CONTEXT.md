@@ -28,6 +28,14 @@ _Avoid_: Application, signup
 One member's whereabouts at one moment — coordinates, accuracy, and when it was last updated. Only the latest position per member exists; there are no trails.
 _Avoid_: Location, fix, ping, trail
 
+**Sharing**:
+This phone keeping its own Position up to date for the Group, which it does only while the app is open. Putting the phone away, even briefly, pauses Sharing; nothing is shared on the way out. A single write of a Position is a publish.
+_Avoid_: Tracking, broadcasting
+
+**Location gate**:
+The check that this phone may share its Position: permission granted and location services on. When it fails, the phone sees why instead of the map.
+_Avoid_: Permission check, lock
+
 **Pin**:
 A Member's latest Position as the map shows it, labelled with their name and its age, and grey when the Member is Stale. Only Members with a Position have a pin.
 _Avoid_: Marker, dot, avatar
