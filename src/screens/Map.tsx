@@ -3,7 +3,7 @@ import { AppState, StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import type { Firestore } from 'firebase/firestore';
 
-import { startSharing, type Sharing } from '../location';
+import { startSharing } from '../location';
 import type { Pin } from '../pins';
 import { usePins } from '../usePins';
 
@@ -77,33 +77,16 @@ function label(pin: Pin): string {
 /** Shares this phone while the map is open, and writes nothing whenever the phone is put away (§6). */
 function usePublishing(db: Firestore, groupId: string, uid: string): void {
   useEffect(() => {
-    let sharing: Sharing | undefined;
-    let open = true;
-
-    const resume = () => {
-      open = true;
-      if (!sharing) {
-        void startSharing({ db, groupId, uid }).then((started) => {
-          sharing = started;
-          if (!open) started.pause(); // Put away while the watch was still starting.
-        });
-        return;
-      }
-      void sharing.resume();
-    };
-    const pause = () => {
-      open = false;
-      sharing?.pause();
-    };
-
-    resume();
+    // The Sharing is in hand before its first watch exists, so pausing it is never too early and this
+    // hook needs no guard of its own (ticket 18).
+    const sharing = startSharing({ db, groupId, uid });
     const subscription = AppState.addEventListener('change', (state) => {
-      if (state === 'active') resume();
-      else pause();
+      if (state === 'active') sharing.resume();
+      else sharing.pause();
     });
     return () => {
       subscription.remove();
-      pause();
+      sharing.pause();
     };
   }, [db, groupId, uid]);
 }

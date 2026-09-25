@@ -54,16 +54,24 @@ export function publishLocation(db: Firestore, groupId: string, uid: string, rea
  * Location sharing while the map is open. The watch and the timer are started together, and both stop on
  * `pause()` without writing anything, which is what "backgrounding or locking the phone writes nothing"
  * means. `resume()` watches again and publishes the held reading at once.
+ *
+ * Every start is stamped with a generation, and a watch that arrives after a later pause or start removes
+ * itself without publishing, so at most one watch and one heartbeat are live however the phone is put away
+ * and brought back (spec §6).
  */
 export type Sharing = {
   pause(): void;
-  resume(): Promise<void>;
+  resume(): void;
 };
 
 export type SharingOptions = { db: Firestore; groupId: string; uid: string };
 
-/** Starts watching while the map is open, publishing the first reading as soon as the OS reports one. */
-export async function startSharing({ db, groupId, uid }: SharingOptions): Promise<Sharing> {
+/**
+ * Starts watching while the map is open, publishing the first reading as soon as the OS reports one. The
+ * Sharing comes back before the first watch does: the OS takes a moment, and the phone may be put away and
+ * brought back inside that window, so the caller has to be able to pause what it started.
+ */
+export function startSharing({ db, groupId, uid }: SharingOptions): Sharing {
   let latest: PositionReading | undefined;
   let watcher: Location.LocationSubscription | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -81,6 +89,8 @@ export async function startSharing({ db, groupId, uid }: SharingOptions): Promis
 
     let delivered = false;
     const started = await Location.watchPositionAsync({ accuracy: Location.Accuracy.High }, ({ coords }) => {
+      // A superseded watch reports nothing, so a phone put away mid-start writes nothing on the way out.
+      if (mine !== generation) return;
       latest = {
         lat: coords.latitude,
         lng: coords.longitude,
@@ -109,11 +119,12 @@ export async function startSharing({ db, groupId, uid }: SharingOptions): Promis
     timer = undefined;
   }
 
-  const resume = () =>
-    watch().catch((error: unknown) => {
+  const resume = () => {
+    void watch().catch((error: unknown) => {
       console.warn('[location] could not watch this phone', error);
     });
+  };
 
-  await resume();
+  resume();
   return { pause, resume };
 }

@@ -41,6 +41,14 @@ import { checkLocationGate, publishLocation, startSharing, type Sharing } from '
 //
 // The pin's age, its Stale line and the reading of a pending write are no longer this module's: ticket 13
 // moved them behind src/pins.ts, and their failing ways are listed at the top of test/pins.test.ts.
+//
+// Ways sharing could fail while the OS is still setting the first watch up (ticket 18), written before the
+// fix. Putting the phone away and bringing it back inside that window:
+// 15. leaves the first watch live, so it goes on reporting after it was superseded.
+// 16. leaves a second 30-second heartbeat running, so the phone publishes twice per beat.
+// 17. lets the superseded watch publish a Position on the way out, which §6 forbids.
+// 18. leaves a watch live after the map closes, so the phone keeps publishing with no map on screen.
+// 19. has the sharing in flight twice over, so the caller has nothing to pause while it is still starting.
 
 const GID = 'group-one';
 const MEMBER = 'member-uid';
@@ -311,16 +319,106 @@ describe('startSharing', () => {
 
   it('leaves no watch behind when the map closes while a watch is still being created', async () => {
     const db = as(MEMBER);
-    sharing = await startSharing({ db, groupId: GID, uid: MEMBER });
+    osLocation.holdWatches();
+    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
+    osLocation.releaseWatches(); // The first watch arrives, and the map shares as usual.
+    await sleep(150);
 
-    const resuming = sharing.resume();
+    osLocation.holdWatches(); // The map closes while the watch the resume asked for is on its way.
+    sharing.resume();
     sharing.pause();
-    await resuming;
     osLocation.emit(READING);
+    await sleep(150);
+    osLocation.releaseWatches();
     await sleep(150);
 
     expect(osLocation.liveWatches()).toHaveLength(0);
     expect((await getDocs(positions(db))).size).toBe(0);
+  });
+});
+
+/**
+ * The OS takes a moment to hand back a subscription, and the phone can be put away and brought back
+ * inside that window. Every test here starts the sharing and pauses it while the first watch is still
+ * being set up, which the fake holds open.
+ */
+describe('startSharing while the first watch is still on its way', () => {
+  let sharing: Sharing | undefined;
+
+  afterEach(() => {
+    sharing?.pause();
+    sharing = undefined;
+    osLocation.releaseWatches();
+    vi.restoreAllMocks();
+  });
+
+  it('writes nothing when the phone is put away before the first watch resolves', async () => {
+    const db = as(MEMBER);
+    osLocation.holdWatches();
+
+    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
+    sharing.pause();
+    osLocation.emit(READING); // The OS reports until the watch it is still setting up is removed.
+    await sleep(150);
+    osLocation.releaseWatches();
+    await sleep(150);
+
+    expect(osLocation.liveWatches()).toHaveLength(0);
+    expect((await getDocs(positions(db))).size).toBe(0);
+  });
+
+  it('holds exactly one watch and one heartbeat when the phone comes back before the first watch resolves', async () => {
+    const db = as(MEMBER);
+    osLocation.holdWatches();
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+
+    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
+    sharing.pause();
+    sharing.resume();
+    osLocation.releaseWatches();
+    await sleep(150);
+
+    expect(osLocation.liveWatches()).toHaveLength(1);
+    expect(intervals.mock.calls.filter(([, delay]) => delay === 30_000)).toHaveLength(1);
+  });
+
+  it('holds one watch and one heartbeat however often the phone is put away and brought back', async () => {
+    const db = as(MEMBER);
+    osLocation.holdWatches();
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+
+    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
+    sharing.pause();
+    sharing.resume();
+    sharing.pause();
+    sharing.resume();
+    osLocation.releaseWatches(); // Every watch the OS was setting up arrives at once.
+    await sleep(150);
+
+    expect(osLocation.liveWatches()).toHaveLength(1);
+    expect(intervals.mock.calls.filter(([, delay]) => delay === 30_000)).toHaveLength(1);
+  });
+
+  it('leaves nothing live and publishes nothing after the map closes', async () => {
+    const db = as(MEMBER);
+    osLocation.holdWatches();
+
+    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
+    sharing.pause();
+    sharing.resume();
+    osLocation.releaseWatches(); // Both watches arrive; the superseded one removes itself.
+    await sleep(150);
+
+    const published = nextPosition(db, (data) => data.lat === READING.lat);
+    osLocation.emit(READING); // The watch that survived is the one publishing.
+    expect((await published).lat).toBe(READING.lat);
+
+    sharing.pause(); // The map closes.
+    osLocation.emit(OTHER_READING);
+    await sleep(150);
+
+    expect(osLocation.liveWatches()).toHaveLength(0);
+    expect((await getDocs(positions(db))).docs.map((each) => each.data().lat)).toEqual([READING.lat]);
   });
 });
 

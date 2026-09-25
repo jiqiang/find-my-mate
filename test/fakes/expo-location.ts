@@ -28,6 +28,9 @@ type Watch = {
   callback: (location: LocationObject) => void;
   live: boolean;
 };
+type Subscription = { remove: () => void };
+/** A watch the OS is still setting up, and the resolver that hands its subscription back later. */
+type Held = { watch: Watch; release: (subscription: Subscription) => void };
 
 export type LocationObject = {
   coords: {
@@ -60,7 +63,11 @@ export const os = {
   services: true,
   /** How many times the OS prompt was shown. */
   prompts: 0,
+  /** Every watch the OS holds, including ones whose subscription has not been handed back yet. */
   watches: [] as Watch[],
+  /** Watches still being set up: the OS is reporting from them but the app cannot remove them yet. */
+  held: [] as Held[],
+  holding: false,
 };
 
 export function reset(): void {
@@ -69,6 +76,8 @@ export function reset(): void {
   os.services = true;
   os.prompts = 0;
   os.watches = [];
+  os.held = [];
+  os.holding = false;
 }
 
 /** The next time the OS prompt appears, the user grants it. */
@@ -94,7 +103,7 @@ export function setServices(enabled: boolean): void {
   os.services = enabled;
 }
 
-/** One reading the OS reports, to every watch the app currently holds. */
+/** One reading the OS reports, to every live watch — a watch still being set up reports like any other. */
 export function emit(reading: Reading): void {
   for (const watch of os.watches.filter((w) => w.live)) {
     watch.callback({
@@ -116,6 +125,25 @@ export function liveWatches(): Watch[] {
   return os.watches.filter((watch) => watch.live);
 }
 
+function subscription(watch: Watch): Subscription {
+  return {
+    remove() {
+      watch.live = false;
+    },
+  };
+}
+
+/** The OS starts setting the watch up and does not hand the app a subscription until `releaseWatches()`. */
+export function holdWatches(): void {
+  os.holding = true;
+}
+
+/** Hand back every subscription the OS has been holding, in the order the watches were created. */
+export function releaseWatches(): void {
+  os.holding = false;
+  for (const { watch, release } of os.held.splice(0)) release(subscription(watch));
+}
+
 export async function getForegroundPermissionsAsync(): Promise<FakePermission> {
   return os.permission;
 }
@@ -130,15 +158,12 @@ export async function hasServicesEnabledAsync(): Promise<boolean> {
   return os.services;
 }
 
-export async function watchPositionAsync(
+export function watchPositionAsync(
   options: Watch['options'],
   callback: Watch['callback'],
-): Promise<{ remove: () => void }> {
+): Promise<Subscription> {
   const watch: Watch = { options, callback, live: true };
   os.watches.push(watch);
-  return {
-    remove() {
-      watch.live = false;
-    },
-  };
+  if (!os.holding) return Promise.resolve(subscription(watch));
+  return new Promise((release) => os.held.push({ watch, release }));
 }
