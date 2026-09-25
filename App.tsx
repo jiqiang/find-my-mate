@@ -80,13 +80,7 @@ export default function App() {
       );
     case 'map':
       return (
-        <Map
-          db={db}
-          groupId={phase.group.id}
-          uid={phase.uid}
-          displayName={phase.group.displayName}
-          groupName={phase.group.name}
-        />
+        <Map db={db} groupId={phase.group.id} uid={phase.uid} groupName={phase.group.name} />
       );
   }
 }

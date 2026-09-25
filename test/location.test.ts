@@ -21,16 +21,7 @@ import {
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as osLocation from './fakes/expo-location';
-import {
-  ageLabel,
-  checkLocationGate,
-  isStale,
-  positionFrom,
-  publishLocation,
-  startSharing,
-  STALE_AFTER_MS,
-  type Sharing,
-} from '../src/location';
+import { checkLocationGate, publishLocation, startSharing, type Sharing } from '../src/location';
 
 // Ways the location gate and the Position publisher (ticket 06) could fail, written before src/location.ts:
 //  1. A permission that has never been asked is never asked, so the phone can never show the map.
@@ -47,9 +38,9 @@ import {
 // 12. Coming back to the foreground publishes nothing until the following 30-second tick.
 // 13. The heartbeat is not a 30-second JS timer, or it never fires.
 // 14. Stopping the watch leaves it live, so the app keeps publishing after the map is gone.
-// 15. Age wording is wrong at the boundaries (59 s / 60 s, 59 min / 60 min, 23 h / 24 h).
-// 16. A pin turns grey before three minutes, or never turns grey.
-// 17. A write whose server timestamp has not landed yet is read as no Position, so the pin flickers.
+//
+// The pin's age, its Stale line and the reading of a pending write are no longer this module's: ticket 13
+// moved them behind src/pins.ts, and their failing ways are listed at the top of test/pins.test.ts.
 
 const GID = 'group-one';
 const MEMBER = 'member-uid';
@@ -333,47 +324,3 @@ describe('startSharing', () => {
   });
 });
 
-describe('the age on a pin', () => {
-  const NOW = Date.UTC(2026, 8, 25, 6, 0, 0);
-
-  it.each([
-    [0, 'now'],
-    [59_000, 'now'],
-    [60_000, '1 min'],
-    [59 * 60_000, '59 min'],
-    [60 * 60_000, '1 h'],
-    [23 * 60 * 60_000, '23 h'],
-    [24 * 60 * 60_000, '1 d'],
-    [50 * 60 * 60_000, '2 d'],
-  ])('reads %i ms of age as "%s"', (ageMs, expected) => {
-    expect(ageLabel(NOW - ageMs, NOW)).toBe(expected);
-  });
-
-  it('stays fresh right up to three minutes, and turns Stale just after', () => {
-    expect(isStale(NOW - STALE_AFTER_MS, NOW)).toBe(false);
-    expect(isStale(NOW - STALE_AFTER_MS - 1, NOW)).toBe(true);
-  });
-});
-
-describe('positionFrom', () => {
-  const NOW = Date.UTC(2026, 8, 25, 6, 0, 0);
-  const stored = { lat: -33.8688, lng: 151.2093, accuracy: 12, updatedAt: Timestamp.fromMillis(1_000), mode: 'foreground' };
-
-  it('reads the stored Position and its server receipt time', () => {
-    expect(positionFrom(stored, NOW)).toEqual({
-      lat: -33.8688,
-      lng: 151.2093,
-      accuracy: 12,
-      updatedAt: 1_000,
-      mode: 'foreground',
-    });
-  });
-
-  it('reads a write whose server stamp has not landed yet as just now, so the pin never flickers', () => {
-    expect(positionFrom({ ...stored, updatedAt: null }, NOW)?.updatedAt).toBe(NOW);
-  });
-
-  it('has no Position at all before the first write', () => {
-    expect(positionFrom(undefined, NOW)).toBeNull();
-  });
-});

@@ -1,33 +1,11 @@
 import * as Location from 'expo-location';
-import {
-  doc,
-  serverTimestamp,
-  setDoc,
-  type DocumentData,
-  type Firestore,
-  type Timestamp,
-} from 'firebase/firestore';
+import { doc, serverTimestamp, setDoc, type Firestore } from 'firebase/firestore';
 
 /** Where the OS says the phone is, at one moment: the coordinates and accuracy a Position is made of. */
 export type PositionReading = { lat: number; lng: number; accuracy: number };
 
-/** A stored Position: the Member's latest whereabouts, with the server's receipt time in epoch ms. */
-export type Position = {
-  lat: number;
-  lng: number;
-  accuracy: number;
-  updatedAt: number;
-  mode: 'foreground';
-};
-
 /** The heartbeat: a JS timer, because watchPositionAsync's `timeInterval` is Android-only (spec §6). */
 export const PUBLISH_INTERVAL_MS = 30_000;
-
-/** A Member is Stale after three minutes without an update; their pin turns grey (§6). */
-export const STALE_AFTER_MS = 3 * 60_000;
-
-/** The map's age ticker: ages re-render on this beat, with no new data needed (§6). */
-export const AGE_TICK_MS = 15_000;
 
 /**
  * Why the map is blocked: the two screens in spec §6. `granted` is the only state that shows the map,
@@ -70,39 +48,6 @@ export function publishLocation(db: Firestore, groupId: string, uid: string, rea
   }).catch((error: unknown) => {
     console.warn('[location] could not publish this Position', error);
   });
-}
-
-/**
- * The stored Position, or null when there is none yet. A write the server has not acknowledged reads back
- * with a null `updatedAt`; the phone's clock stands in, which §6 accepts, so the pin keeps its place
- * instead of blinking out on every heartbeat.
- */
-export function positionFrom(data: DocumentData | undefined, now: number): Position | null {
-  if (!data) return null;
-  const updatedAt = data.updatedAt as Timestamp | null | undefined;
-  return {
-    lat: data.lat,
-    lng: data.lng,
-    accuracy: data.accuracy,
-    updatedAt: updatedAt ? updatedAt.toMillis() : now,
-    mode: data.mode,
-  };
-}
-
-/** `{age}` on the pin: "now" under 60 s, "N min" under 60 min, "N h" under 24 h, "N d" beyond (§6). */
-export function ageLabel(updatedAt: number, now: number): string {
-  const seconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
-  if (seconds < 60) return 'now';
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} min`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} h`;
-  return `${Math.floor(hours / 24)} d`;
-}
-
-/** More than three minutes without an update, and only then: the pin turns grey and stays on the map. */
-export function isStale(updatedAt: number, now: number): boolean {
-  return now - updatedAt > STALE_AFTER_MS;
 }
 
 /**
