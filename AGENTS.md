@@ -1,8 +1,8 @@
 # find-my-mate
 
-A family location-sharing app: Expo + TypeScript (React Native) on Firebase, for 4 people in one group to see each other on a live map. Planning artefacts and the issue tracker live under `.scratch/`.
+A family location-sharing app: Expo + TypeScript (React Native) on Firebase, for 4 people in one group to see each other on a live map. GitHub Issues on jiqiang/find-my-mate are the single source of truth for work: specs, tickets, status and blockers.
 
-## Coding rules
+## Rules of testing
 
 * NEVER write unit tests after you write code.
 * Highly prefer E2E tests as the sole testing mechanism. Use them to verify complex features work. At the end of E2E tests, produce a verifiable and repeatable artifact.
@@ -12,7 +12,7 @@ A family location-sharing app: Expo + TypeScript (React Native) on Firebase, for
 
 ### Issue tracker
 
-Local markdown under `.scratch/`, one directory per feature. See `docs/agents/issue-tracker.md`.
+GitHub Issues for jiqiang/find-my-mate, via the `gh` CLI, are the single source of truth. Never track issues, ticket status or blockers in local files (including `.scratch/`); read and write them on GitHub. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
