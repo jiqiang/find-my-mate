@@ -64,6 +64,16 @@ Map props: use only the surface common to both providers — `initialRegion`, `<
 `showsUserLocation`, `onRegionChangeComplete`, `onPress`, `mapType: "standard"`. Do not use platform-only
 props; iOS and Android will never look identical, and that is accepted.
 
+**Known blocker, found 2026-09-25: the Android map is grey in Expo Go.** Expo Go for Android (SDK 55–57, incl.
+the Play Store 57.0.9) ships a shared Google Maps API key that Google now rejects with "The provided API key
+is expired" (expo/expo#49323, open). The map view mounts (`onMapReady` fires) and draws the Google logo, but
+`onMapLoaded` never fires and no tiles load. A `<UrlTile>` overlay (OpenStreetMap) with `mapType="none"` was
+tried and stays grey too. Nothing in the app can supply a different key inside Expo Go. Decision: **wait for
+Expo to ship a fixed Expo Go** and keep building against the iPhone map meanwhile. To check whether the key
+has been replaced, pull the new key from the Expo Go APK (or the issue) and request
+`https://maps.googleapis.com/maps/api/staticmap?center=0,0&zoom=1&size=10x10&key=$KEY`; an "expired" reply
+means it is still broken.
+
 `showsUserLocation` fails silently if permission has not been granted. The map is never shown without
 permission (§7.6), so this is satisfied by construction.
 
@@ -555,6 +565,10 @@ No composite indexes are needed: every read is a single-document `get` or a whol
   advertises the WSL NAT address (`172.23.x.x`), which phones cannot reach; `npx expo start --tunnel` (with
   `npm i -g @expo/ngrok` installed once) is what works. Full LAN speed needs, on the Windows side,
   `networkingMode=mirrored` under `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`.
+- **The tunnel hostname must not contain an underscore.** It is built from `urlRandomness` in
+  `.expo/settings.json` (per machine, gitignored), e.g. `c_aq1ay-<user>-8081.exp.direct`. iOS Expo Go accepts
+  that; Android Expo Go refuses it with *"Failed to download remote update"* and never requests the bundle.
+  Set `urlRandomness` to lowercase letters and digits only (e.g. `fmmtab7`) and restart `npx expo start --tunnel`.
 - The dev machine is part of the runtime. Laptop asleep or dev server stopped means nobody can open the app.
 
 ### First time, with all four phones in the room
