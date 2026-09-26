@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import type { Firestore } from 'firebase/firestore';
@@ -26,15 +26,17 @@ type Props = {
 export default function Map({ db, groupId, uid, groupName }: Props) {
   const map = useRef<MapView>(null);
   const centred = useRef(false);
+  const [ready, setReady] = useState(false);
   const pins = usePins(db, groupId, uid);
   const mine = pins.find((pin) => pin.mine);
 
   useEffect(() => {
-    // Centre on the first Pin this phone has, so its own pin is on screen as soon as there is one.
-    if (centred.current || !mine) return;
+    // Centre on the first Pin this phone has, so its own pin is on screen as soon as there is one. iOS drops
+    // a camera move made before the map is ready, and Sharing's Pin can already be there when the map mounts.
+    if (!ready || centred.current || !mine) return;
     centred.current = true;
     map.current?.animateToRegion({ latitude: mine.lat, longitude: mine.lng, ...NEIGHBOURHOOD }, 300);
-  }, [mine]);
+  }, [ready, mine]);
 
   return (
     <View style={StyleSheet.absoluteFill}>
@@ -43,6 +45,7 @@ export default function Map({ db, groupId, uid, groupName }: Props) {
         style={StyleSheet.absoluteFill}
         initialRegion={PLACEHOLDER_REGION}
         mapType="standard"
+        onMapReady={() => setReady(true)}
       >
         {pins.map((pin) => (
           <Marker
