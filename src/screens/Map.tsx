@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import type { Firestore } from 'firebase/firestore';
 
+import { centreOnFirstPin, type FirstCentre } from '../camera';
 import type { Pin } from '../pins';
 import { usePins } from '../usePins';
 
@@ -13,8 +14,6 @@ const PLACEHOLDER_REGION = {
   latitudeDelta: 0.05,
   longitudeDelta: 0.05,
 };
-// Roughly a neighbourhood: the zoom the recentre button will use (spec §7.4).
-const NEIGHBOURHOOD = { latitudeDelta: 0.01, longitudeDelta: 0.01 };
 
 type Props = {
   db: Firestore;
@@ -25,18 +24,13 @@ type Props = {
 
 export default function Map({ db, groupId, uid, groupName }: Props) {
   const map = useRef<MapView>(null);
-  const centred = useRef(false);
-  const [ready, setReady] = useState(false);
+  const firstCentre = useRef<FirstCentre | undefined>(undefined);
+  firstCentre.current ??= centreOnFirstPin((region) => map.current?.animateToRegion(region, 300));
   const pins = usePins(db, groupId, uid);
-  const mine = pins.find((pin) => pin.mine);
 
   useEffect(() => {
-    // Centre on the first Pin this phone has, so its own pin is on screen as soon as there is one. iOS drops
-    // a camera move made before the map is ready, and Sharing's Pin can already be there when the map mounts.
-    if (!ready || centred.current || !mine) return;
-    centred.current = true;
-    map.current?.animateToRegion({ latitude: mine.lat, longitude: mine.lng, ...NEIGHBOURHOOD }, 300);
-  }, [ready, mine]);
+    firstCentre.current?.pins(pins);
+  }, [pins]);
 
   return (
     <View style={StyleSheet.absoluteFill}>
@@ -45,7 +39,7 @@ export default function Map({ db, groupId, uid, groupName }: Props) {
         style={StyleSheet.absoluteFill}
         initialRegion={PLACEHOLDER_REGION}
         mapType="standard"
-        onMapReady={() => setReady(true)}
+        onMapReady={() => firstCentre.current?.mapReady()}
       >
         {pins.map((pin) => (
           <Marker
