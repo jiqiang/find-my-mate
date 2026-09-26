@@ -20,6 +20,13 @@ import {
  * the commit, and with it the order that keeps a failed write from leaving the phone pointing at nothing.
  */
 
+/**
+ * The Group's cap on Members (spec §5): four people. It is a **soft** cap — rules cannot count
+ * documents — so the Owner's client is what refuses a fifth approval (`approveJoinRequest`), and the
+ * rules only freeze the number written at Create.
+ */
+export const MAX_MEMBERS = 4;
+
 /** The whole `groups` collection. Only for a rules-disabled listing, since the rules allow no list. */
 export function groupsRef(db: Firestore): CollectionReference {
   return collection(db, 'groups');
@@ -84,7 +91,7 @@ export function addCreateGroup(
   batch.set(groupRef(db, gid), {
     name: groupName,
     ownerUid,
-    maxMembers: 4,
+    maxMembers: MAX_MEMBERS,
     createdAt: serverTimestamp(),
     activeInviteCode: null,
   });

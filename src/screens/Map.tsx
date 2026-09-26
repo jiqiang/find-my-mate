@@ -4,12 +4,16 @@ import MapView, { Marker } from 'react-native-maps';
 import type { Firestore } from 'firebase/firestore';
 
 import { centreOnFirstPin, type FirstCentre } from '../camera';
+import { joinQueue } from '../joinQueue';
 import type { Pin } from '../pins';
-import { approveJoinRequest, type MemberRole } from '../session';
+import { FULL_GROUP_MESSAGE, type MemberRole } from '../session';
+import { useApproveJoin } from '../useApproveJoin';
+import { useMemberCount } from '../useMemberCount';
 import { usePendingJoinRequests } from '../usePendingJoinRequests';
 import { usePins } from '../usePins';
 import Button from './Button';
 import InviteSomeone from './InviteSomeone';
+import JoinRequests from './JoinRequests';
 
 // Somewhere to open before the app has a Pin of its own to centre on.
 const PLACEHOLDER_COORDINATE = { latitude: -33.8688, longitude: 151.2093 };
@@ -43,10 +47,21 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
   const isOwner = role === 'owner';
   // The rules deny the Join-request listing to everyone but the Owner, so nobody else asks for it.
   const requests = usePendingJoinRequests(db, groupId, isOwner);
-  const [approving, setApproving] = useState(false);
+  // The Group's Member count decides whether Approve may be offered at the four-Member cap (spec §5).
+  const memberCount = useMemberCount(db, groupId, isOwner);
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => new Set());
+  const queue = joinQueue(requests, memberCount, dismissed);
+  const banner = queue.banner;
+  const { approve, approving, error: approveError } = useApproveJoin({
+    db,
+    ownerUid: uid,
+    groupId,
+    groupName,
+    ownerName: yourName,
+  });
   const [greetingVisible, setGreetingVisible] = useState(justJoined === true);
-  // The ⋯ menu and Invite someone; the items built later (Members, Join requests, Leave) land here.
-  const [panel, setPanel] = useState<'none' | 'menu' | 'invite'>('none');
+  // The ⋯ menu, Invite someone and Join requests; the items built later (Members, Leave) land here.
+  const [panel, setPanel] = useState<'none' | 'menu' | 'invite' | 'joinRequests'>('none');
 
   useEffect(() => {
     firstCentre.current?.pins(pins);
@@ -60,17 +75,10 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
     return () => clearTimeout(timer);
   }, [justJoined]);
 
-  async function approve() {
-    const request = requests[0];
-    if (!request || approving) return;
-    setApproving(true);
-    try {
-      await approveJoinRequest(db, uid, groupId, request.uid, { groupName, ownerName: yourName });
-    } catch (error) {
-      console.warn('[session] could not approve the Join request', error);
-    } finally {
-      setApproving(false);
-    }
+  /** "Not now" writes nothing: it hides this request's banner for the rest of the session (spec §7.5). */
+  function notNow() {
+    if (!banner) return;
+    setDismissed((current) => new Set(current).add(banner.uid));
   }
 
   return (
@@ -99,8 +107,8 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
       <View style={styles.header} pointerEvents="none">
         <Text style={styles.groupName}>{groupName}</Text>
       </View>
-      {/* The ⋯ menu holds only the Owner's Invite someone until the Members and Leave items land, so it
-          is the Owner's alone for now; a non-Owner would have nothing to open. */}
+      {/* The ⋯ menu holds the Owner's Join requests (when any are pending) and Invite someone, until the
+          Members and Leave items land; a non-Owner has nothing to open. */}
       {isOwner && (
         <Pressable
           style={styles.menuButton}
@@ -117,6 +125,15 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
           {/* Tapping anywhere off the menu dismisses it. */}
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setPanel('none')} />
           <View style={styles.menu}>
+            {queue.count > 0 && (
+              <Pressable
+                style={styles.menuItem}
+                accessibilityRole="button"
+                onPress={() => setPanel('joinRequests')}
+              >
+                <Text style={styles.menuItemLabel}>Join requests ({queue.count})</Text>
+              </Pressable>
+            )}
             <Pressable style={styles.menuItem} accessibilityRole="button" onPress={() => setPanel('invite')}>
               <Text style={styles.menuItemLabel}>Invite someone</Text>
             </Pressable>
@@ -137,10 +154,35 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
         </View>
       )}
 
-      {isOwner && requests[0] && (
+      {panel === 'joinRequests' && (
+        <View style={StyleSheet.absoluteFill}>
+          <JoinRequests
+            db={db}
+            uid={uid}
+            groupId={groupId}
+            groupName={groupName}
+            ownerName={yourName}
+            requests={queue.requests}
+            full={queue.full}
+            onClose={() => setPanel('none')}
+          />
+        </View>
+      )}
+
+      {isOwner && banner && (
         <View style={styles.joinBanner}>
-          <Text style={styles.joinBannerText}>{requests[0].displayName} wants to join this group.</Text>
-          {approving ? <ActivityIndicator /> : <Button label="Approve" onPress={approve} />}
+          <Text style={styles.joinBannerText}>{banner.displayName} wants to join this group.</Text>
+          {queue.full && <Text style={styles.joinBannerFull}>{FULL_GROUP_MESSAGE}</Text>}
+          {approveError && <Text style={styles.joinBannerError}>{approveError}</Text>}
+          <View style={styles.joinBannerActions}>
+            {!queue.full &&
+              (approving === banner.uid ? (
+                <ActivityIndicator />
+              ) : (
+                <Button label="Approve" onPress={() => approve(banner.uid)} />
+              ))}
+            <Button label="Not now" onPress={notNow} />
+          </View>
         </View>
       )}
 
@@ -213,6 +255,9 @@ const styles = StyleSheet.create({
     elevation: 4,
   },
   joinBannerText: { fontSize: 16, fontWeight: '600' },
+  joinBannerFull: { fontSize: 15, color: '#555' },
+  joinBannerError: { fontSize: 15, color: '#b00020' },
+  joinBannerActions: { flexDirection: 'row', gap: 12 },
   welcome: { ...TOP_BANNER, backgroundColor: 'rgba(26,115,232,0.95)' },
   welcomeText: { color: 'white', fontSize: 16, fontWeight: '600', textAlign: 'center' },
   pin: {

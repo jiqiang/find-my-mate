@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   getDoc,
+  getDocs,
   onSnapshot,
   Timestamp,
   writeBatch,
@@ -19,7 +20,9 @@ import {
   inviteRef,
   joinRequestRef,
   joinRequestsRef,
+  MAX_MEMBERS,
   memberRef,
+  membersRef,
   newGroupId,
 } from './groupDocs';
 
@@ -319,9 +322,35 @@ export function watchPendingJoinRequests(
 }
 
 /**
+ * Follows the Group's Members for the Owner's cap check (spec §5): each snapshot reports how many
+ * Members the Group has. The rules admit the listing to a Member, so the Owner's phone may subscribe.
+ * Returns the unsubscribe; a failed read is logged, not thrown into the UI.
+ */
+export function watchMemberCount(
+  db: Firestore,
+  groupId: string,
+  onChange: (count: number) => void,
+): () => void {
+  return onSnapshot(
+    membersRef(db, groupId),
+    (snapshot) => onChange(snapshot.size),
+    (error) => console.warn('[session] could not follow the Members', error),
+  );
+}
+
+/**
+ * The Owner's refusal when the Group is full (spec §5, §7.5): the rules cannot count documents, so the
+ * Owner's client holds the cap and this is the message the banner and the list show.
+ */
+export const FULL_GROUP_MESSAGE = 'This group is full. Remove someone first.';
+
+/**
  * The Owner's Approve (spec §5, §7.5): one batch marks the Join request `approved` and rotates the Invite
  * code, the replacement written before the old document is deleted. No push is sent: the joiner's own
  * request listener sees the change and writes its Member document.
+ *
+ * The Group's Member count is read first: rules cannot count documents, so the Owner's client is what
+ * refuses a fifth approval (§5). A full Group throws {@link FULL_GROUP_MESSAGE} and writes nothing.
  */
 export async function approveJoinRequest(
   db: Firestore,
@@ -330,7 +359,12 @@ export async function approveJoinRequest(
   requesterUid: string,
   { groupName, ownerName }: { groupName: string; ownerName: string },
 ): Promise<void> {
-  const previousCode = await activeInviteCode(db, groupId);
+  const [previousCode, members] = await Promise.all([
+    activeInviteCode(db, groupId),
+    getDocs(membersRef(db, groupId)),
+  ]);
+  if (members.size >= MAX_MEMBERS) throw new Error(FULL_GROUP_MESSAGE);
+
   const batch = writeBatch(db);
   addApproveJoin(batch, db, groupId, requesterUid, {
     code: newInviteCode(),

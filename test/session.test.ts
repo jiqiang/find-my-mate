@@ -13,16 +13,18 @@ import {
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { as, env, modular, sleep, useRulesEnvironment } from './fakes/rules';
-import { addMintInvite, groupRef, groupsRef, inviteRef, joinRequestRef, memberRef } from '../src/groupDocs';
+import { addJoinMember, addMintInvite, groupRef, groupsRef, inviteRef, joinRequestRef, memberRef } from '../src/groupDocs';
 import {
   approveJoinRequest,
   becomeMember,
   createGroup,
   ensureInvite,
+  FULL_GROUP_MESSAGE,
   joinGroup,
   loadStart,
   newInviteCode,
   rotateInvite,
+  watchMemberCount,
   watchPendingJoinRequests,
   type InviteCode,
   type PendingJoinRequest,
@@ -77,6 +79,13 @@ import {
 // 35. A non-owner can approve, when only the Owner may.
 // 36. The Owner's pending-request watcher reports approved requests as pending, or misses a later one.
 // 37. The watcher reports another Group's requests, or survives its unsubscribe.
+//
+// Ways the four-Member cap (ticket 09) could fail, written before the code:
+// 38. The Owner approves a fifth Member when the Group already has four; the cap is not checked at all.
+// 39. The cap counts pending Join requests as Members, so a Group with room refuses an approval.
+// 40. A refused approval still marks the request approved or rotates the code.
+// 41. watchMemberCount reports a wrong or stale count, so the Owner's map offers Approve into a full Group.
+// 42. watchMemberCount reports a count to a non-member, whom the rules should deny.
 
 const OWNER = 'owner-uid';
 const OTHER = 'joiner-uid';
@@ -402,6 +411,89 @@ describe('approveJoinRequest', () => {
     await env.withSecurityRulesDisabled(async (ctx) => {
       expect((await getDoc(joinRequestRef(modular(ctx), groupId, OTHER))).data()!.status).toBe('pending');
     });
+  });
+});
+
+/** Adds an admitted Member to a Group outside the rules, so a test can reach the four-Member cap. */
+async function addMember(groupId: string, uid: string, displayName: string): Promise<void> {
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = modular(ctx);
+    const batch = writeBatch(db);
+    addJoinMember(batch, db, groupId, uid, { displayName });
+    await batch.commit();
+  });
+}
+
+/** Waits until `check` holds, or gives up after ~2 s; an unmet check then fails on the next assertion. */
+async function until(check: () => boolean): Promise<void> {
+  for (let i = 0; i < 100 && !check(); i += 1) await sleep(20);
+}
+
+describe('the four-Member cap (spec §5)', () => {
+  it('refuses to approve into a full Group, leaving the request pending and the old code live', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await addMember(groupId, 'member-2', 'Alex');
+    await addMember(groupId, 'member-3', 'Ravi');
+    await addMember(groupId, 'member-4', 'Nina');
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+
+    await expect(
+      approveJoinRequest(as(OWNER), OWNER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Sam' }),
+    ).rejects.toThrow(FULL_GROUP_MESSAGE);
+
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDoc(joinRequestRef(modular(ctx), groupId, OTHER))).data()!.status).toBe('pending');
+    });
+    expect(await inviteExists(invite.code)).toBe(true);
+    expect((await getDoc(groupRef(as(OWNER), groupId))).data()!.activeInviteCode).toBe(invite.code);
+  });
+
+  it('approves when the Group is one short of the cap', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await addMember(groupId, 'member-2', 'Alex');
+    await addMember(groupId, 'member-3', 'Ravi');
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+
+    await approveJoinRequest(as(OWNER), OWNER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Sam' });
+
+    expect((await getDoc(joinRequestRef(as(OWNER), groupId, OTHER))).data()!.status).toBe('approved');
+  });
+
+  it('counts Members, not pending Join requests: a lone request does not fill the Group', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+
+    await approveJoinRequest(as(OWNER), OWNER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Sam' });
+
+    expect((await getDoc(joinRequestRef(as(OWNER), groupId, OTHER))).data()!.status).toBe('approved');
+  });
+});
+
+describe('watchMemberCount', () => {
+  it('reports the Group’s Member count as Members are admitted', async () => {
+    const { groupId } = await groupWithInvite();
+    const seen: number[] = [];
+    const stop = watchMemberCount(as(OWNER), groupId, (count) => seen.push(count));
+
+    await until(() => seen.includes(1));
+    expect(seen.at(-1)).toBe(1);
+
+    await addMember(groupId, 'member-2', 'Alex');
+    await until(() => seen.includes(2));
+    expect(seen.at(-1)).toBe(2);
+
+    stop();
+  });
+
+  it('reports nothing to a non-member: the rules deny the listing', async () => {
+    const { groupId } = await groupWithInvite();
+    const seen: number[] = [];
+    const stop = watchMemberCount(as(STRANGER), groupId, (count) => seen.push(count));
+
+    await sleep(300);
+
+    expect(seen).toEqual([]);
+    stop();
   });
 });
 
