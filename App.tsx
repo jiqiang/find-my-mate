@@ -5,16 +5,17 @@ import { appStateForeground } from './src/foreground';
 import BlockedPermission from './src/screens/BlockedPermission';
 import FirstRun from './src/screens/FirstRun';
 import Map from './src/screens/Map';
+import Waiting from './src/screens/Waiting';
 import type { Group } from './src/session';
 import { usePhase } from './src/usePhase';
 import { useSharing } from './src/useSharing';
 
 /**
  * The app shell: one screen per phase, and no decision of its own. The launch decision lives in
- * `src/phases.ts` (spec §7.1), including Create moving First run to sharing.
+ * `src/phases.ts` (spec §7.1), including Create moving First run to sharing and Join moving it to Waiting.
  */
 export default function App() {
-  const { phase, createGroup } = usePhase({ db, signIn });
+  const { phase, createGroup, join } = usePhase({ db, signIn });
 
   switch (phase.name) {
     case 'loading':
@@ -22,7 +23,9 @@ export default function App() {
     case 'error':
       return <Loading error={phase.message} />;
     case 'firstRun':
-      return <FirstRun onCreate={createGroup} />;
+      return <FirstRun onCreate={createGroup} onJoin={join} />;
+    case 'waiting':
+      return <Waiting ownerName={phase.ownerName} />;
     case 'sharing':
       return <SharingScreen uid={phase.uid} group={phase.group} />;
   }
@@ -36,7 +39,9 @@ function SharingScreen({ uid, group }: { uid: string; group: Group }) {
   const { gate, recheck } = useSharing({ db, groupId: group.id, uid, foreground: appStateForeground });
 
   if (gate === 'checking') return <Loading />;
-  if (gate === 'granted') return <Map db={db} groupId={group.id} uid={uid} groupName={group.name} />;
+  if (gate === 'granted') {
+    return <Map db={db} groupId={group.id} uid={uid} groupName={group.name} ownerName={group.displayName ?? ''} />;
+  }
   return <BlockedPermission reason={gate} onTryAgain={recheck} />;
 }
 

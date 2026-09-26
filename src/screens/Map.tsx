@@ -1,11 +1,12 @@
-import { useEffect, useRef } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import type { Firestore } from 'firebase/firestore';
 
 import { centreOnFirstPin, type FirstCentre } from '../camera';
 import type { Pin } from '../pins';
 import { usePins } from '../usePins';
+import InviteSomeone from './InviteSomeone';
 
 // Somewhere to open before the app has a Pin of its own to centre on.
 const PLACEHOLDER_COORDINATE = { latitude: -33.8688, longitude: 151.2093 };
@@ -20,13 +21,16 @@ type Props = {
   groupId: string;
   uid: string;
   groupName: string;
+  ownerName: string;
 };
 
-export default function Map({ db, groupId, uid, groupName }: Props) {
+export default function Map({ db, groupId, uid, groupName, ownerName }: Props) {
   const map = useRef<MapView>(null);
   const firstCentre = useRef<FirstCentre | undefined>(undefined);
   firstCentre.current ??= centreOnFirstPin((region) => map.current?.animateToRegion(region, 300));
   const pins = usePins(db, groupId, uid);
+  // The ⋯ menu and Invite someone; the items built later (Members, Join requests, Leave) land here.
+  const [panel, setPanel] = useState<'none' | 'menu' | 'invite'>('none');
 
   useEffect(() => {
     firstCentre.current?.pins(pins);
@@ -54,9 +58,43 @@ export default function Map({ db, groupId, uid, groupName }: Props) {
           </Marker>
         ))}
       </MapView>
+
       <View style={styles.header} pointerEvents="none">
         <Text style={styles.groupName}>{groupName}</Text>
       </View>
+      <Pressable
+        style={styles.menuButton}
+        accessibilityRole="button"
+        accessibilityLabel="Menu"
+        onPress={() => setPanel(panel === 'menu' ? 'none' : 'menu')}
+      >
+        <Text style={styles.menuButtonLabel}>⋯</Text>
+      </Pressable>
+
+      {panel === 'menu' && (
+        <>
+          {/* Tapping anywhere off the menu dismisses it. */}
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setPanel('none')} />
+          <View style={styles.menu}>
+            <Pressable style={styles.menuItem} accessibilityRole="button" onPress={() => setPanel('invite')}>
+              <Text style={styles.menuItemLabel}>Invite someone</Text>
+            </Pressable>
+          </View>
+        </>
+      )}
+
+      {panel === 'invite' && (
+        <View style={StyleSheet.absoluteFill}>
+          <InviteSomeone
+            db={db}
+            uid={uid}
+            groupId={groupId}
+            groupName={groupName}
+            ownerName={ownerName}
+            onClose={() => setPanel('none')}
+          />
+        </View>
+      )}
     </View>
   );
 }
@@ -80,6 +118,34 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   groupName: { fontSize: 17, fontWeight: '600' },
+  menuButton: {
+    position: 'absolute',
+    top: 56,
+    right: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+  },
+  menuButtonLabel: { fontSize: 22, fontWeight: '700' },
+  menu: {
+    position: 'absolute',
+    top: 104,
+    right: 16,
+    minWidth: 180,
+    backgroundColor: 'white',
+    borderRadius: 12,
+    paddingVertical: 4,
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
+  },
+  menuItem: { paddingHorizontal: 16, paddingVertical: 12 },
+  menuItemLabel: { fontSize: 16 },
   pin: {
     backgroundColor: '#1a73e8',
     borderRadius: 12,

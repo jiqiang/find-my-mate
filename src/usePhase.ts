@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { startPhases, type Phase, type Phases, type PhasesOptions } from './phases';
+import type { JoinResult } from './session';
 
 /**
- * The UI's whole view of the launch decision: the current phase and First run's Create. It owns no
- * logic of its own — Phases decides every transition — and starts in an effect and stops on unmount, so
- * a render that is thrown away never leaves a sign-in or group load behind.
+ * The UI's whole view of the launch decision: the current phase, First run's Create, and First run's Join.
+ * It owns no logic of its own — Phases decides every transition — and starts in an effect and stops on
+ * unmount, so a render that is thrown away never leaves a sign-in or group load behind.
  */
 export function usePhase(options: PhasesOptions): {
   phase: Phase;
   createGroup: (yourName: string, groupName: string) => Promise<void>;
+  join: (code: string, yourName: string) => Promise<JoinResult>;
 } {
   const { db, signIn } = options;
   const phases = useRef<Phases | undefined>(undefined);
@@ -32,5 +34,11 @@ export function usePhase(options: PhasesOptions): {
     [],
   );
 
-  return { phase, createGroup };
+  const join = useCallback(
+    (code: string, yourName: string) =>
+      phases.current?.join(code, yourName) ?? Promise.reject(new Error('The launch phases are not ready.')),
+    [],
+  );
+
+  return { phase, createGroup, join };
 }

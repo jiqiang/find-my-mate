@@ -5,6 +5,7 @@ import {
   type CollectionReference,
   type DocumentReference,
   type Firestore,
+  type Timestamp,
   type WriteBatch,
 } from 'firebase/firestore';
 
@@ -87,4 +88,80 @@ export function addCreateGroup(
     role: 'owner',
     joinedAt: serverTimestamp(),
   });
+}
+
+/**
+ * Adds one phone's pending Join request to `batch`: the typed name, `status: 'pending'`, a server
+ * `requestedAt` and the Invite code that opened the door (spec §3). The rules require the code to still be
+ * live and pointed at this Group, which is why joining reads the Invite before this write.
+ */
+export function addJoinRequest(
+  batch: WriteBatch,
+  db: Firestore,
+  gid: string,
+  uid: string,
+  { displayName, inviteCode }: { displayName: string; inviteCode: string },
+): void {
+  batch.set(joinRequestRef(db, gid, uid), {
+    displayName,
+    status: 'pending',
+    requestedAt: serverTimestamp(),
+    inviteCode,
+  });
+}
+
+/**
+ * Adds the approved joiner's own Member document to `batch`: `role: 'member'` and a server `joinedAt`. The
+ * rules admit this write only once the same uid's Join request says `approved` (`approved(gid)`), so it
+ * never runs before the Owner has approved.
+ */
+export function addJoinMember(
+  batch: WriteBatch,
+  db: Firestore,
+  gid: string,
+  uid: string,
+  { displayName }: { displayName: string },
+): void {
+  batch.set(memberRef(db, gid, uid), {
+    displayName,
+    role: 'member',
+    joinedAt: serverTimestamp(),
+  });
+}
+
+/**
+ * Adds a minted Invite code to `batch` (spec §3, §5): the `invites/{code}` document, the Group's
+ * `activeInviteCode` pointer, and — when there was a previous code — the deletion of the old document.
+ * Order matters as the spec states it: the replacement is written first, the pointer moves next, and the
+ * old document goes last, all in one atomic batch, so no phone can ever read a Group that points at a code
+ * that does not exist and no `revoked` state has to exist.
+ */
+export function addMintInvite(
+  batch: WriteBatch,
+  db: Firestore,
+  gid: string,
+  code: string,
+  {
+    groupName,
+    ownerName,
+    createdBy,
+    expiresAt,
+    previousCode,
+  }: {
+    groupName: string;
+    ownerName: string;
+    createdBy: string;
+    expiresAt: Timestamp;
+    previousCode?: string | null;
+  },
+): void {
+  batch.set(inviteRef(db, code), {
+    groupId: gid,
+    groupName,
+    ownerName,
+    createdBy,
+    expiresAt,
+  });
+  batch.set(groupRef(db, gid), { activeInviteCode: code }, { merge: true });
+  if (previousCode && previousCode !== code) batch.delete(inviteRef(db, previousCode));
 }

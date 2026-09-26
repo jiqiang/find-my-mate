@@ -7,12 +7,22 @@ import {
   getDocs,
   Timestamp,
   updateDoc,
+  writeBatch,
 } from 'firebase/firestore';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { as, env, modular, useRulesEnvironment } from './fakes/rules';
-import { groupRef, groupsRef, memberRef } from '../src/groupDocs';
-import { createGroup, loadGroup } from '../src/session';
+import { addMintInvite, groupRef, groupsRef, inviteRef, joinRequestRef, memberRef } from '../src/groupDocs';
+import {
+  becomeMember,
+  createGroup,
+  ensureInvite,
+  joinGroup,
+  loadStart,
+  newInviteCode,
+  rotateInvite,
+  type InviteCode,
+} from '../src/session';
 
 // Ways Create (ticket 05) could fail, written before src/session.ts:
 //  1. A blank or whitespace-only Your name or Group name is accepted.
@@ -26,9 +36,40 @@ import { createGroup, loadGroup } from '../src/session';
 //  9. Relaunching finds the stored groupId but not the Group name for the map.
 // 10. A stored groupId whose Member document is gone (or unreadable) is treated as still in the Group.
 // 11. Relaunching with no network strands the phone on a spinner instead of reaching the map.
+//
+// Ways Invite rotation (ticket 07) could fail, written before the code:
+// 12. A code is not 8 characters, or carries one of the ambiguous 0/O/1/I/L.
+// 13. The code is not written as invites/{code} plus the Group's activeInviteCode, or names the wrong Group.
+// 14. The Invite's groupName/ownerName/createdBy are wrong, or expiresAt is a phone clock sentinel / not 24 h.
+// 15. Opening Invite someone mints a second code although a live one exists.
+// 16. An expired activeInviteCode is handed back instead of being replaced.
+// 17. Rotating deletes the replacement or leaves the old document, so there are two live codes or none.
+// 18. A non-owner can mint, when only the Owner may.
+//
+// Ways Join (ticket 07) could fail, written before the code:
+// 19. A blank Your name is accepted.
+// 20. A wrong, expired or already-used code writes a Join request anyway.
+// 21. A valid code writes the request under the wrong path, or with a client requestedAt / no inviteCode /
+//     a non-pending status.
+// 22. The Invite's permission-denied (the expired case) surfaces as an error instead of "That code isn't
+//     right."
+// 23. groupId/groupName/ownerName are stored before the request commits, or not stored at all.
+// 24. A bad code stores anything or writes anything.
+//
+// Ways the §7.1 start read (ticket 07) could fail, written before the code:
+// 25. A stored groupId whose own Join request is pending is treated as First run or as membership.
+// 26. A pending joiner's stored ownerName is lost on relaunch, so Waiting cannot name the Owner.
+// 27. A stored groupId whose own request is approved but whose Member document is absent never writes the
+//     Member document.
+// 28. A stored groupId with no Member and no request is treated as membership.
+// 29. A member relaunch loses the Group name or its own displayName.
+// 30. Offline, a member or a pending joiner is stranded instead of trusting the stored names.
 
 const OWNER = 'owner-uid';
+const OTHER = 'joiner-uid';
 const STRANGER = 'stranger-uid';
+
+const live = () => Timestamp.fromDate(new Date(Date.now() + 24 * 60 * 60 * 1000));
 
 useRulesEnvironment();
 
@@ -36,6 +77,47 @@ beforeEach(async () => {
   await env.clearFirestore();
   await AsyncStorage.clear();
 });
+
+/**
+ * The Owner's Group with one live Invite minted the way the app mints it. Storage is cleared afterwards:
+ * the caller is usually standing in for a different phone, which must not inherit the Owner's stored
+ * groupId/displayName.
+ */
+async function groupWithInvite(ownerName = 'Sam', groupName = 'The Smiths'): Promise<{ groupId: string; invite: InviteCode }> {
+  const db = as(OWNER);
+  const group = await createGroup(db, OWNER, ownerName, groupName);
+  const invite = await ensureInvite(db, OWNER, group.id, { groupName, ownerName });
+  await AsyncStorage.clear();
+  return { groupId: group.id, invite };
+}
+
+/**
+ * Whether an Invite document is still there, read outside the rules: `getDoc` as a signed-in phone on a
+ * deleted Invite trips the §4 `allow get` rule (`resource.data` on a null resource), which is not the
+ * question here.
+ */
+async function inviteExists(code: string): Promise<boolean> {
+  let exists = false;
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    exists = (await getDoc(inviteRef(modular(ctx), code))).exists();
+  });
+  return exists;
+}
+
+/** Seeds an expired Invite and the Group pointer to it, outside the rules (the rules forbid minting one). */
+async function seedExpiredInvite(groupId: string, code: string): Promise<void> {
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = modular(ctx);
+    const batch = writeBatch(db);
+    addMintInvite(batch, db, groupId, code, {
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+      createdBy: OWNER,
+      expiresAt: Timestamp.fromDate(new Date(Date.now() - 1000)),
+    });
+    await batch.commit();
+  });
+}
 
 describe('createGroup', () => {
   it('writes the Group and the Owner in one batch the rules accept, and stores groupId', async () => {
@@ -91,45 +173,252 @@ describe('createGroup', () => {
   });
 });
 
-describe('loadGroup (relaunch)', () => {
-  it('returns null when no groupId is stored', async () => {
-    expect(await loadGroup(as(OWNER), OWNER)).toBeNull();
+describe('newInviteCode', () => {
+  // §7.5 says both "the unambiguous 32-character alphabet `…GHJKLMNP…`" and "(no 0/O, no 1/I/L)". The two
+  // disagree: dropping L leaves 31 symbols, and only the 32-symbol string yields the ~40 bits also claimed.
+  // The string — and the 32-character claim — is what is implemented, so L is kept; see the type's comment.
+  it('is 8 characters from the spec’s 32-character alphabet, with no 0/O/1/I', () => {
+    const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    expect(new Set(alphabet).size).toBe(32);
+    for (let i = 0; i < 250; i += 1) {
+      const code = newInviteCode();
+      expect(code).toHaveLength(8);
+      for (const character of code) expect(alphabet).toContain(character);
+      expect(code).not.toMatch(/[0O1I]/);
+    }
   });
 
-  it('returns the stored Group with its name and this phone’s name after Create', async () => {
+  it('does not repeat itself', () => {
+    const codes = new Set(Array.from({ length: 100 }, () => newInviteCode()));
+    expect(codes.size).toBe(100);
+  });
+});
+
+describe('ensureInvite', () => {
+  it('mints a live code on first open and points the Group at it', async () => {
+    const db = as(OWNER);
+    const group = await createGroup(db, OWNER, 'Sam', 'The Smiths');
+
+    const invite = await ensureInvite(db, OWNER, group.id, { groupName: 'The Smiths', ownerName: 'Sam' });
+
+    expect(invite.code).toHaveLength(8);
+    expect(invite.expiresAt.getTime()).toBeGreaterThan(Date.now());
+    const stored = (await getDoc(inviteRef(db, invite.code))).data()!;
+    expect(Object.keys(stored).sort()).toEqual(['createdBy', 'expiresAt', 'groupId', 'groupName', 'ownerName']);
+    expect(stored.groupId).toBe(group.id);
+    expect(stored.groupName).toBe('The Smiths');
+    expect(stored.ownerName).toBe('Sam');
+    expect(stored.createdBy).toBe(OWNER);
+    expect((await getDoc(groupRef(db, group.id))).data()!.activeInviteCode).toBe(invite.code);
+  });
+
+  it('hands back the live code instead of minting a second one', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    const again = await ensureInvite(as(OWNER), OWNER, groupId, { groupName: 'The Smiths', ownerName: 'Sam' });
+
+    expect(again.code).toBe(invite.code);
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDocs(collection(modular(ctx), 'invites'))).size).toBe(1);
+    });
+  });
+
+  it('replaces an expired activeInviteCode rather than handing it back', async () => {
+    const db = as(OWNER);
+    const group = await createGroup(db, OWNER, 'Sam', 'The Smiths');
+    await seedExpiredInvite(group.id, 'EXPIRED2');
+
+    const fresh = await ensureInvite(db, OWNER, group.id, { groupName: 'The Smiths', ownerName: 'Sam' });
+
+    expect(fresh.code).not.toBe('EXPIRED2');
+    expect(fresh.expiresAt.getTime()).toBeGreaterThan(Date.now());
+    expect(await inviteExists('EXPIRED2')).toBe(false);
+    expect((await getDoc(groupRef(db, group.id))).data()!.activeInviteCode).toBe(fresh.code);
+  });
+
+  it('cannot mint as a non-owner: the rules deny it', async () => {
+    const { groupId } = await groupWithInvite();
+
+    await expect(
+      ensureInvite(as(STRANGER), STRANGER, groupId, { groupName: 'The Smiths', ownerName: 'Stranger' }),
+    ).rejects.toThrow();
+  });
+});
+
+describe('rotateInvite', () => {
+  it('mints a replacement and deletes the old document, leaving one live code', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    const db = as(OWNER);
+
+    const replacement = await rotateInvite(db, OWNER, groupId, { groupName: 'The Smiths', ownerName: 'Sam' });
+
+    expect(replacement.code).not.toBe(invite.code);
+    expect(await inviteExists(invite.code)).toBe(false);
+    expect((await getDoc(groupRef(db, groupId))).data()!.activeInviteCode).toBe(replacement.code);
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDocs(collection(modular(ctx), 'invites'))).size).toBe(1);
+    });
+  });
+});
+
+describe('joinGroup', () => {
+  it('reads the code once, writes the pending Join request, and stores the three names', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    const joiner = as(OTHER);
+
+    const result = await joinGroup(joiner, OTHER, ` ${invite.code.toLowerCase()} `, '  Priya ');
+
+    expect(result).toEqual({ ok: true, groupId, groupName: 'The Smiths', ownerName: 'Sam' });
+    const request = (await getDoc(joinRequestRef(joiner, groupId, OTHER))).data()!;
+    expect(Object.keys(request).sort()).toEqual(['displayName', 'inviteCode', 'requestedAt', 'status']);
+    expect(request.displayName).toBe('Priya');
+    expect(request.status).toBe('pending');
+    expect(request.inviteCode).toBe(invite.code);
+    expect(request.requestedAt).toBeInstanceOf(Timestamp);
+    expect(await AsyncStorage.getItem('groupId')).toBe(groupId);
+    expect(await AsyncStorage.getItem('groupName')).toBe('The Smiths');
+    expect(await AsyncStorage.getItem('ownerName')).toBe('Sam');
+  });
+
+  it.each(['ZZZZZZZZ', ''])('refuses a wrong code (%j): nothing written, nothing stored', async (code) => {
+    const { groupId } = await groupWithInvite();
+
+    expect(await joinGroup(as(OTHER), OTHER, code, 'Priya')).toEqual({ ok: false, reason: 'bad-code' });
+    expect(await AsyncStorage.getItem('groupId')).toBeNull();
+    expect(await AsyncStorage.getItem('ownerName')).toBeNull();
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDocs(collection(modular(ctx), 'groups', groupId, 'joinRequests'))).size).toBe(0);
+    });
+  });
+
+  it('refuses an expired code: nothing written', async () => {
+    const db = as(OWNER);
+    const group = await createGroup(db, OWNER, 'Sam', 'The Smiths');
+    await seedExpiredInvite(group.id, 'EXPIRED2');
+
+    expect(await joinGroup(as(OTHER), OTHER, 'EXPIRED2', 'Priya')).toEqual({ ok: false, reason: 'bad-code' });
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDocs(collection(modular(ctx), 'groups', group.id, 'joinRequests'))).size).toBe(0);
+    });
+  });
+
+  it('refuses a code whose document is already gone (already used): nothing written', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await deleteDoc(inviteRef(modular(ctx), invite.code));
+    });
+
+    expect(await joinGroup(as(OTHER), OTHER, invite.code, 'Priya')).toEqual({ ok: false, reason: 'bad-code' });
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDocs(collection(modular(ctx), 'groups', groupId, 'joinRequests'))).size).toBe(0);
+    });
+  });
+
+  it('rejects a blank name before reading anything', async () => {
+    const { invite } = await groupWithInvite();
+
+    await expect(joinGroup(as(OTHER), OTHER, invite.code, '   ')).rejects.toThrow();
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDocs(collection(modular(ctx), 'invites'))).size).toBe(1);
+    });
+  });
+});
+
+describe('becomeMember', () => {
+  it('writes members/{uid} with role member, a server joinedAt and the typed name, then stores the name', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+    await approveRequest(groupId);
+
+    const group = await becomeMember(as(OTHER), OTHER, groupId, 'The Smiths');
+
+    expect(group).toEqual({ id: groupId, name: 'The Smiths', displayName: 'Priya' });
+    const member = (await getDoc(memberRef(as(OTHER), groupId, OTHER))).data()!;
+    expect(Object.keys(member).sort()).toEqual(['displayName', 'joinedAt', 'role']);
+    expect(member.displayName).toBe('Priya');
+    expect(member.role).toBe('member');
+    expect(member.joinedAt).toBeInstanceOf(Timestamp);
+    expect(await AsyncStorage.getItem('displayName')).toBe('Priya');
+  });
+});
+
+/** Flips the joiner's own request to approved, outside the rules (the Owner's action lands in ticket 08). */
+async function approveRequest(groupId: string): Promise<void> {
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    await updateDoc(joinRequestRef(modular(ctx), groupId, OTHER), { status: 'approved' });
+  });
+}
+
+describe('loadStart (spec §7.1)', () => {
+  it('is First run when no groupId is stored', async () => {
+    expect(await loadStart(as(OWNER), OWNER)).toEqual({ kind: 'firstRun' });
+  });
+
+  it('is the member Group after Create', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
-    // A fresh Firestore instance stands in for the relaunched app: nothing is carried over in memory.
-    expect(await loadGroup(as(OWNER), OWNER)).toEqual({ id: created.id, name: 'The Smiths', displayName: 'Sam' });
+    expect(await loadStart(as(OWNER), OWNER)).toEqual({
+      kind: 'member',
+      group: { id: created.id, name: 'The Smiths', displayName: 'Sam' },
+    });
   });
 
-  it('takes the name off the Member document, so a rename reaches the map', async () => {
+  it('is the member Group with a renamed displayName', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
     await updateDoc(memberRef(as(OWNER), created.id, OWNER), { displayName: 'Samantha' });
 
-    expect(await loadGroup(as(OWNER), OWNER)).toEqual({
-      id: created.id,
-      name: 'The Smiths',
-      displayName: 'Samantha',
+    expect(await loadStart(as(OWNER), OWNER)).toEqual({
+      kind: 'member',
+      group: { id: created.id, name: 'The Smiths', displayName: 'Samantha' },
     });
   });
 
-  it('returns null when this phone is not a Member of the stored Group', async () => {
-    await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
-    expect(await loadGroup(as(STRANGER), STRANGER)).toBeNull();
-  });
-
-  it('returns null when the Member document has been deleted', async () => {
+  it('is First run when this phone is not a Member and has no request', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
-    await env.withSecurityRulesDisabled(async (ctx) => {
-      await deleteDoc(memberRef(modular(ctx), created.id, OWNER));
-    });
-    expect(await loadGroup(as(OWNER), OWNER)).toBeNull();
+    expect(await loadStart(as(STRANGER), STRANGER)).toEqual({ kind: 'firstRun' });
+    expect(created.id).toBeTruthy();
   });
 
-  it('falls back to the stored names when offline', async () => {
+  it('is Waiting when the stored Group’s own Join request is pending, naming the Owner from storage', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+
+    expect(await loadStart(as(OTHER), OTHER)).toEqual({
+      kind: 'waiting',
+      groupId,
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+    });
+  });
+
+  it('is approved when the request is approved but this phone has no Member document yet', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+    await approveRequest(groupId);
+
+    expect(await loadStart(as(OTHER), OTHER)).toEqual({ kind: 'approved', groupId, groupName: 'The Smiths' });
+  });
+
+  it('falls back to the stored member names when offline', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
     const offline = as(OWNER);
     await disableNetwork(offline);
-    expect(await loadGroup(offline, OWNER)).toEqual({ id: created.id, name: 'The Smiths', displayName: 'Sam' });
+
+    expect(await loadStart(offline, OWNER)).toEqual({
+      kind: 'member',
+      group: { id: created.id, name: 'The Smiths', displayName: 'Sam' },
+    });
+  });
+
+  it('stays Waiting offline after a join, naming the Owner from storage', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+    const offline = as(OTHER);
+    await disableNetwork(offline);
+
+    expect(await loadStart(offline, OTHER)).toEqual({
+      kind: 'waiting',
+      groupId,
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+    });
   });
 });

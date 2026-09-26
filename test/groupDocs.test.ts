@@ -1,11 +1,14 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { getDoc, serverTimestamp, Timestamp, writeBatch } from 'firebase/firestore';
+import { collection, getDoc, getDocs, serverTimestamp, setDoc, Timestamp, writeBatch } from 'firebase/firestore';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { as, env, useRulesEnvironment } from './fakes/rules';
+import { as, env, modular, useRulesEnvironment } from './fakes/rules';
 import {
   addCreateGroup,
+  addJoinMember,
+  addJoinRequest,
+  addMintInvite,
   groupRef,
   groupsRef,
   inviteRef,
@@ -33,6 +36,7 @@ const OWNER = 'owner-uid';
 const OTHER = 'other-uid';
 const GID = 'group-one';
 const CODE = 'LIVE01';
+const OTHER_CODE = 'CODE02';
 
 useRulesEnvironment();
 
@@ -93,6 +97,160 @@ describe('addCreateGroup', () => {
     const gid = newGroupId(db);
     const batch = writeBatch(db);
     batch.set(memberRef(db, gid, OWNER), { displayName: 'Sam', role: 'owner', joinedAt: serverTimestamp() });
+
+    await expect(batch.commit()).rejects.toThrow();
+  });
+});
+
+// Ways the Join, Member-admission and Invite batch builders (ticket 07) could fail, written before the
+// builders:
+//  1. A Join request carries the wrong fields (a client requestedAt, a missing inviteCode, a non-pending
+//     status) or lands under the wrong path.
+//  2. An expired or absent Invite still opens a Join request, so a dead code is a door.
+//  3. A joiner admits itself as a Member while its request is still pending.
+//  4. The admitted Member carries the wrong role, a phone-clock joinedAt, or a stray field.
+//  5. An Invite carries the wrong fields, points at the wrong Group, or names the wrong creator.
+//  6. Rotation leaves the old document behind, so two codes are live; or deletes the replacement, so none
+//     is; or fails to move the Group's `activeInviteCode` pointer.
+//  7. The builder is not accepted by the §4 rules (a stray field, a wrong role, a phone clock).
+
+const live = () => Timestamp.fromDate(new Date(Date.now() + 24 * 60 * 60 * 1000));
+const expired = () => Timestamp.fromDate(new Date(Date.now() - 1000));
+
+/** A Group with one Invite, seeded through the same builders the app uses. */
+async function seedGroupWithInvite(code = CODE, expiresAt = live()): Promise<void> {
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = modular(ctx);
+    const batch = writeBatch(db);
+    addCreateGroup(batch, db, GID, { ownerUid: OWNER, displayName: 'Sam', groupName: 'The Smiths' });
+    addMintInvite(batch, db, GID, code, {
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+      createdBy: OWNER,
+      expiresAt,
+    });
+    await batch.commit();
+  });
+}
+
+describe('addMintInvite', () => {
+  it('writes invites/{code} and the Group’s pointer, in the one batch the rules accept', async () => {
+    const db = as(OWNER);
+    const batch = writeBatch(db);
+    addCreateGroup(batch, db, GID, { ownerUid: OWNER, displayName: 'Sam', groupName: 'The Smiths' });
+    await batch.commit();
+
+    const expiresAt = live();
+    const mint = writeBatch(db);
+    addMintInvite(mint, db, GID, CODE, {
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+      createdBy: OWNER,
+      expiresAt,
+    });
+    await mint.commit();
+
+    const invite = (await getDoc(inviteRef(db, CODE))).data()!;
+    expect(Object.keys(invite).sort()).toEqual(['createdBy', 'expiresAt', 'groupId', 'groupName', 'ownerName']);
+    expect(invite.groupId).toBe(GID);
+    expect(invite.groupName).toBe('The Smiths');
+    expect(invite.ownerName).toBe('Sam');
+    expect(invite.createdBy).toBe(OWNER);
+    expect(invite.expiresAt).toEqual(expiresAt);
+
+    expect((await getDoc(groupRef(db, GID))).data()!.activeInviteCode).toBe(CODE);
+  });
+
+  it('rotates: the replacement is live, the old document is gone, and one code remains', async () => {
+    const db = as(OWNER);
+    const create = writeBatch(db);
+    addCreateGroup(create, db, GID, { ownerUid: OWNER, displayName: 'Sam', groupName: 'The Smiths' });
+    await create.commit();
+
+    const first = writeBatch(db);
+    addMintInvite(first, db, GID, CODE, {
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+      createdBy: OWNER,
+      expiresAt: live(),
+    });
+    await first.commit();
+
+    const rotate = writeBatch(db);
+    addMintInvite(rotate, db, GID, OTHER_CODE, {
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+      createdBy: OWNER,
+      expiresAt: live(),
+      previousCode: CODE,
+    });
+    await rotate.commit();
+
+    expect((await getDoc(groupRef(db, GID))).data()!.activeInviteCode).toBe(OTHER_CODE);
+    // The listing is read outside the rules: `getDoc` on the deleted code trips §4's `allow get`
+    // (`resource.data` on a null resource), and the question here is which codes remain.
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const invites = await getDocs(collection(modular(ctx), 'invites'));
+      expect(invites.docs.map((each) => each.id)).toEqual([OTHER_CODE]);
+    });
+  });
+});
+
+describe('addJoinRequest', () => {
+  it('writes joinRequests/{uid}: the typed name, pending, a server requestedAt and the code that opened it', async () => {
+    await seedGroupWithInvite();
+    const db = as(OTHER);
+    const batch = writeBatch(db);
+    addJoinRequest(batch, db, GID, OTHER, { displayName: 'Priya', inviteCode: CODE });
+    await batch.commit();
+
+    const request = (await getDoc(joinRequestRef(db, GID, OTHER))).data()!;
+    expect(Object.keys(request).sort()).toEqual(['displayName', 'inviteCode', 'requestedAt', 'status']);
+    expect(request.displayName).toBe('Priya');
+    expect(request.status).toBe('pending');
+    expect(request.inviteCode).toBe(CODE);
+    expect(request.requestedAt).toBeInstanceOf(Timestamp);
+  });
+
+  it('is denied with an expired Invite, so a dead code cannot open a request', async () => {
+    await seedGroupWithInvite(CODE, expired());
+    const db = as(OTHER);
+    const batch = writeBatch(db);
+    addJoinRequest(batch, db, GID, OTHER, { displayName: 'Priya', inviteCode: CODE });
+
+    await expect(batch.commit()).rejects.toThrow();
+  });
+});
+
+describe('addJoinMember', () => {
+  it('admits the joiner as a member with a server joinedAt once the request is approved', async () => {
+    await seedGroupWithInvite();
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(joinRequestRef(modular(ctx), GID, OTHER), {
+        displayName: 'Priya',
+        status: 'approved',
+        requestedAt: Timestamp.now(),
+        inviteCode: CODE,
+      });
+    });
+
+    const db = as(OTHER);
+    const batch = writeBatch(db);
+    addJoinMember(batch, db, GID, OTHER, { displayName: 'Priya' });
+    await batch.commit();
+
+    const member = (await getDoc(memberRef(db, GID, OTHER))).data()!;
+    expect(Object.keys(member).sort()).toEqual(['displayName', 'joinedAt', 'role']);
+    expect(member.displayName).toBe('Priya');
+    expect(member.role).toBe('member');
+    expect(member.joinedAt).toBeInstanceOf(Timestamp);
+  });
+
+  it('is denied while the Join request is still pending', async () => {
+    await seedGroupWithInvite();
+    const db = as(OTHER);
+    const batch = writeBatch(db);
+    addJoinMember(batch, db, GID, OTHER, { displayName: 'Priya' });
 
     await expect(batch.commit()).rejects.toThrow();
   });
