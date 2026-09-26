@@ -82,7 +82,9 @@ permission (§7.6), so this is satisfied by construction.
 Keep it to these modules — this is the whole app:
 
 ```
-App.tsx           the phase switch: loading → firstRun | waiting | sharing; Sharing's gate picks map or blocked
+App.tsx           renders one screen per phase; Sharing's gate picks map or blocked
+src/phases.ts     the phase decision: sign in → stored Group → First run, Waiting or sharing (§7.1)
+src/usePhase.ts   the hook over Phases — the current phase and First run's Create
 src/firebase.ts   initializeApp + initializeAuth (AsyncStorage persistence) + getFirestore
 src/session.ts    groupId in AsyncStorage; createGroup, join, approve, leave, removeMember, invite rotation
 src/groupDocs.ts  every groups/{id}/… and invites/{code} path, and the multi-document batches the rules' getAfter() needs; session.ts commits them
@@ -390,7 +392,8 @@ foreground-only. A 15 s cadence would risk the cap outright; 30 s is the decisio
 
 ### 7.1 The phase switch
 
-`App.tsx` holds exactly one decision, checked in this order (the order matters):
+`src/phases.ts` holds exactly one decision, checked in this order (the order matters); `App.tsx` only
+renders the screen the current phase names:
 
 1. No stored `groupId` → **First run** (§7.2).
 2. Stored `groupId` + own join request `pending` → **Waiting** (§7.3).

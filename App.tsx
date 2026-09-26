@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
 import { db, signIn } from './src/firebase';
@@ -6,42 +5,24 @@ import { appStateForeground } from './src/foreground';
 import BlockedPermission from './src/screens/BlockedPermission';
 import FirstRun from './src/screens/FirstRun';
 import Map from './src/screens/Map';
-import { createGroup, loadGroup, type Group } from './src/session';
+import type { Group } from './src/session';
+import { usePhase } from './src/usePhase';
 import { useSharing } from './src/useSharing';
 
-type Phase =
-  | { name: 'loading'; error?: string }
-  | { name: 'firstRun'; uid: string }
-  | { name: 'sharing'; uid: string; group: Group };
-
+/**
+ * The app shell: one screen per phase, and no decision of its own. The launch decision lives in
+ * `src/phases.ts` (spec §7.1), including Create moving First run to sharing.
+ */
 export default function App() {
-  const [phase, setPhase] = useState<Phase>({ name: 'loading' });
-
-  useEffect(() => {
-    (async () => {
-      const user = await signIn();
-      console.log(`[auth] signed in as ${user.uid}`);
-      const group = await loadGroup(db, user.uid);
-      setPhase(group ? { name: 'sharing', uid: user.uid, group } : { name: 'firstRun', uid: user.uid });
-    })().catch((error: unknown) => {
-      console.warn('[app] start-up failed', error);
-      setPhase({ name: 'loading', error: String(error) });
-    });
-  }, []);
+  const { phase, createGroup } = usePhase({ db, signIn });
 
   switch (phase.name) {
     case 'loading':
-      return <Loading error={phase.error} />;
+      return <Loading />;
+    case 'error':
+      return <Loading error={phase.message} />;
     case 'firstRun':
-      return (
-        <FirstRun
-          onCreate={async (yourName, groupName) => {
-            // Create asks for location permission, then shows the map (spec §7.2), which Sharing does.
-            const group = await createGroup(db, phase.uid, yourName, groupName);
-            setPhase({ name: 'sharing', uid: phase.uid, group });
-          }}
-        />
-      );
+      return <FirstRun onCreate={createGroup} />;
     case 'sharing':
       return <SharingScreen uid={phase.uid} group={phase.group} />;
   }
