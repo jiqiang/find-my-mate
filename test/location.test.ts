@@ -1,27 +1,20 @@
-import { readFileSync } from 'node:fs';
-import {
-  initializeTestEnvironment,
-  type RulesTestContext,
-  type RulesTestEnvironment,
-} from '@firebase/rules-unit-testing';
 import {
   collection,
   disableNetwork,
   doc,
   getDocs,
-  onSnapshot,
   serverTimestamp,
   setDoc,
-  setLogLevel,
   Timestamp,
   writeBatch,
   type DocumentData,
   type Firestore,
 } from 'firebase/firestore';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as osLocation from './fakes/expo-location';
 import { fakeForeground } from './fakes/foreground';
+import { as, env, modular, sleep, useRulesEnvironment, waitForSnapshot } from './fakes/rules';
 import {
   checkLocationGate,
   publishLocation,
@@ -76,48 +69,17 @@ const STRANGER = 'stranger-uid';
 const READING = { lat: -33.8688, lng: 151.2093, accuracy: 12 };
 const OTHER_READING = { lat: -33.8711, lng: 151.2111, accuracy: 8 };
 
-let env: RulesTestEnvironment;
-
-const modular = (ctx: RulesTestContext) => ctx.firestore() as unknown as Firestore;
-const as = (uid: string) => modular(env.authenticatedContext(uid));
 const positionRef = (db: Firestore, uid: string) => doc(db, 'groups', GID, 'locations', uid);
 const positions = (db: Firestore) => collection(db, 'groups', GID, 'locations');
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Resolves with the stored Position the next time the server's view of it matches. Snapshots with the
  * write still pending are ignored: they have no server `updatedAt` yet, which is the point of asserting.
  */
-function nextPosition(db: Firestore, matches: (data: DocumentData) => boolean): Promise<DocumentData> {
-  return new Promise((resolve, reject) => {
-    let stop: (() => void) | undefined;
-    const timer = setTimeout(() => {
-      stop?.();
-      reject(new Error('the Position never matched within 5 s'));
-    }, 5000);
-    stop = onSnapshot(positionRef(db, MEMBER), (snapshot) => {
-      const data = snapshot.data();
-      if (data && !snapshot.metadata.hasPendingWrites && matches(data)) {
-        clearTimeout(timer);
-        stop?.();
-        resolve(data);
-      }
-    });
-  });
-}
+const nextPosition = (db: Firestore, matches: (data: DocumentData) => boolean): Promise<DocumentData> =>
+  waitForSnapshot(positionRef(db, MEMBER), matches, 'settled');
 
-beforeAll(async () => {
-  setLogLevel('error');
-  env = await initializeTestEnvironment({
-    projectId: 'demo-find-my-mate',
-    firestore: { rules: readFileSync('firestore.rules', 'utf8') },
-  });
-});
-
-afterAll(async () => {
-  await env?.cleanup();
-});
+useRulesEnvironment();
 
 beforeEach(async () => {
   await env.clearFirestore();

@@ -1,24 +1,18 @@
 import { readFileSync } from 'node:fs';
 import {
-  initializeTestEnvironment,
-  type RulesTestContext,
-  type RulesTestEnvironment,
-} from '@firebase/rules-unit-testing';
-import {
   disableNetwork,
   doc,
-  onSnapshot,
   serverTimestamp,
   setDoc,
-  setLogLevel,
   Timestamp,
   updateDoc,
   writeBatch,
   type DocumentData,
   type Firestore,
 } from 'firebase/firestore';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { as, env, modular, sleep, useRulesEnvironment, waitForSnapshot } from './fakes/rules';
 import { subscribeToPins, type Pin } from '../src/pins';
 import { publishLocation } from '../src/location';
 
@@ -62,13 +56,6 @@ const SEEDED_POSITIONS: Record<string, { lat: number; lng: number; accuracy: num
   [ALEX]: { lat: -33.8765, lng: 151.2001, accuracy: 20 },
 };
 
-let env: RulesTestEnvironment;
-
-const modular = (ctx: RulesTestContext) => ctx.firestore() as unknown as Firestore;
-const as = (uid: string) => modular(env.authenticatedContext(uid));
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 /**
  * A map-shaped subscriber: it keeps every list of Pins the module hands out, in the order they arrived,
  * so a test can wait for the one that proves what it is asking about.
@@ -106,23 +93,8 @@ class PinWatch {
  * Resolves with the Position as this phone's own cache holds it while the write is still pending, which is
  * the only state in which the server's `updatedAt` has not landed. Rejects if the write settles first.
  */
-function pendingPosition(db: Firestore, uid: string): Promise<DocumentData> {
-  return new Promise((resolve, reject) => {
-    let stop: (() => void) | undefined;
-    const timer = setTimeout(() => {
-      stop?.();
-      reject(new Error('the Position never showed as pending within 5 s'));
-    }, 5000);
-    stop = onSnapshot(doc(db, 'groups', GID, 'locations', uid), (snapshot) => {
-      const data = snapshot.data();
-      if (data && snapshot.metadata.hasPendingWrites) {
-        clearTimeout(timer);
-        stop?.();
-        resolve(data);
-      }
-    });
-  });
-}
+const pendingPosition = (db: Firestore, uid: string): Promise<DocumentData> =>
+  waitForSnapshot(doc(db, 'groups', GID, 'locations', uid), () => true, 'pending');
 
 /**
  * Captures the module's own 15-second beat so a test can fire it without waiting, which is how the age
@@ -140,17 +112,7 @@ function capturedBeat(): () => void {
 
 let watch: PinWatch | undefined;
 
-beforeAll(async () => {
-  setLogLevel('error');
-  env = await initializeTestEnvironment({
-    projectId: 'demo-find-my-mate',
-    firestore: { rules: readFileSync('firestore.rules', 'utf8') },
-  });
-});
-
-afterAll(async () => {
-  await env?.cleanup();
-});
+useRulesEnvironment();
 
 beforeEach(async () => {
   await env.clearFirestore();

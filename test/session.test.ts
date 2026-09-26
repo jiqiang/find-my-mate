@@ -1,10 +1,4 @@
-import { readFileSync } from 'node:fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {
-  initializeTestEnvironment,
-  type RulesTestContext,
-  type RulesTestEnvironment,
-} from '@firebase/rules-unit-testing';
 import {
   collection,
   deleteDoc,
@@ -12,13 +6,12 @@ import {
   doc,
   getDoc,
   getDocs,
-  setLogLevel,
   Timestamp,
   updateDoc,
-  type Firestore,
 } from 'firebase/firestore';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 
+import { as, env, modular, useRulesEnvironment } from './fakes/rules';
 import { createGroup, loadGroup } from '../src/session';
 
 // Ways Create (ticket 05) could fail, written before src/session.ts:
@@ -37,22 +30,7 @@ import { createGroup, loadGroup } from '../src/session';
 const OWNER = 'owner-uid';
 const STRANGER = 'stranger-uid';
 
-let env: RulesTestEnvironment;
-
-const modular = (ctx: RulesTestContext) => ctx.firestore() as unknown as Firestore;
-const as = (uid: string) => modular(env.authenticatedContext(uid));
-
-beforeAll(async () => {
-  setLogLevel('error');
-  env = await initializeTestEnvironment({
-    projectId: 'demo-find-my-mate',
-    firestore: { rules: readFileSync('firestore.rules', 'utf8') },
-  });
-});
-
-afterAll(async () => {
-  await env?.cleanup();
-});
+useRulesEnvironment();
 
 beforeEach(async () => {
   await env.clearFirestore();

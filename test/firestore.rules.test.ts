@@ -1,11 +1,4 @@
-import { readFileSync } from 'node:fs';
-import {
-  assertFails,
-  assertSucceeds,
-  initializeTestEnvironment,
-  type RulesTestContext,
-  type RulesTestEnvironment,
-} from '@firebase/rules-unit-testing';
+import { assertFails, assertSucceeds } from '@firebase/rules-unit-testing';
 import {
   collection,
   deleteDoc,
@@ -13,14 +6,15 @@ import {
   getDoc,
   getDocs,
   serverTimestamp,
-  setLogLevel,
   setDoc,
   Timestamp,
   updateDoc,
   writeBatch,
   type Firestore,
 } from 'firebase/firestore';
-import { afterAll, beforeAll, beforeEach, describe, it } from 'vitest';
+import { beforeEach, describe, it } from 'vitest';
+
+import { as, env, modular, useRulesEnvironment } from './fakes/rules';
 
 const GID = 'group-one';
 const OTHER_GID = 'group-two';
@@ -32,11 +26,6 @@ const STRANGER = 'stranger-uid';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-let env: RulesTestEnvironment;
-
-// The test contexts hand back the compat Firestore type; the modular API accepts the instance at runtime.
-const modular = (ctx: RulesTestContext) => ctx.firestore() as unknown as Firestore;
-const as = (uid: string) => modular(env.authenticatedContext(uid));
 const anon = () => modular(env.unauthenticatedContext());
 
 const groupRef = (db: Firestore, gid = GID) => doc(db, 'groups', gid);
@@ -121,18 +110,8 @@ async function seedGroupWithMember() {
   await createOwnMember(MEMBER);
 }
 
-beforeAll(async () => {
-  // Denials are the point of most tests; the SDK would log each one as an error.
-  setLogLevel('silent');
-  env = await initializeTestEnvironment({
-    projectId: 'demo-find-my-mate',
-    firestore: { rules: readFileSync('firestore.rules', 'utf8') },
-  });
-});
-
-afterAll(async () => {
-  await env.cleanup();
-});
+// Denials are the point of most tests; the SDK would log each one as an error.
+useRulesEnvironment('silent');
 
 beforeEach(async () => {
   await env.clearFirestore();
