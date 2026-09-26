@@ -91,10 +91,10 @@ src/groupDocs.ts  every groups/{id}/… and invites/{code} path, and the multi-d
 src/location.ts   the Location gate, the Sharing lifecycle (foreground → watch/pause) and publishLocation() — the only Position writer
 src/foreground.ts the Foreground signal over AppState that the app shell injects into Sharing (ADR 0001)
 src/useSharing.ts the hook over Sharing — the UI's gate answer and Try again
-src/pins.ts       watches the Group's Members and Positions; hands out the Pins the map draws (§7.4)
-src/usePins.ts    the hook over it — the map renders what it hands back and holds no reading logic
-src/camera.ts     the map's first centring: on this phone's Pin, once, only after the map is ready
-src/screens/      FirstRun, Join, Waiting, Map, BlockedPermission
+src/groupView.ts  watches the Group's Members and Positions; hands out the whole map view (§7.4)
+src/useGroupView.ts the hook over it — the map renders what it hands back and holds no reading logic
+src/camera.ts     the map's first framing and recentre zoom, once, only after the map is ready
+src/screens/      FirstRun, Join, Waiting, Map, Members, BlockedPermission
 firestore.rules   §4, verbatim
 firebase.json     points the Firebase CLI at firestore.rules
 ```

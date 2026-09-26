@@ -43,7 +43,7 @@ import {
 // 14. Stopping the watch leaves it live, so the app keeps publishing after the map is gone.
 //
 // The pin's age, its Stale line and the reading of a pending write are no longer this module's: ticket 13
-// moved them behind src/pins.ts, and their failing ways are listed at the top of test/pins.test.ts.
+// moved them behind src/groupView.ts, and their failing ways are listed at the top of test/groupView.test.ts.
 //
 // Ways sharing could fail while the OS is still setting the first watch up (ticket 18), written before the
 // fix. Putting the phone away and bringing it back inside that window:

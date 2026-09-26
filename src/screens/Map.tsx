@@ -3,19 +3,20 @@ import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-nati
 import MapView, { Marker } from 'react-native-maps';
 import type { Firestore } from 'firebase/firestore';
 
-import { centreOnFirstPin, type FirstCentre } from '../camera';
+import { frameFirstPins, neighbourhoodRegion, type FirstFrame } from '../camera';
+import type { Pin } from '../groupView';
 import { joinQueue } from '../joinQueue';
-import type { Pin } from '../pins';
 import { FULL_GROUP_MESSAGE, type MemberRole } from '../session';
 import { useApproveJoin } from '../useApproveJoin';
+import { useGroupView } from '../useGroupView';
 import { useMemberCount } from '../useMemberCount';
 import { usePendingJoinRequests } from '../usePendingJoinRequests';
-import { usePins } from '../usePins';
 import Button from './Button';
 import InviteSomeone from './InviteSomeone';
 import JoinRequests from './JoinRequests';
+import Members from './Members';
 
-// Somewhere to open before the app has a Pin of its own to centre on.
+// Somewhere to open before the app has a Pin of its own to frame or centre on.
 const PLACEHOLDER_COORDINATE = { latitude: -33.8688, longitude: 151.2093 };
 const PLACEHOLDER_REGION = {
   ...PLACEHOLDER_COORDINATE,
@@ -26,8 +27,8 @@ const PLACEHOLDER_REGION = {
 // How long the approved joiner's one-off welcome banner stays before it disappears (spec §7.3).
 const GREETING_MS = 5000;
 
-// The geometry every top banner shares.
-const TOP_BANNER = { position: 'absolute', top: 104, left: 16, right: 16, borderRadius: 12, padding: 16 } as const;
+// The look every top banner shares; the stack they sit in owns where they are pinned.
+const TOP_BANNER = { borderRadius: 12, padding: 16 } as const;
 
 type Props = {
   db: Firestore;
@@ -41,9 +42,16 @@ type Props = {
 
 export default function Map({ db, groupId, uid, groupName, yourName, role, justJoined }: Props) {
   const map = useRef<MapView>(null);
-  const firstCentre = useRef<FirstCentre | undefined>(undefined);
-  firstCentre.current ??= centreOnFirstPin((region) => map.current?.animateToRegion(region, 300));
-  const pins = usePins(db, groupId, uid);
+  const firstFrame = useRef<FirstFrame | undefined>(undefined);
+  firstFrame.current ??= frameFirstPins({
+    fit: (coordinates, padding) =>
+      map.current?.fitToCoordinates([...coordinates], {
+        edgePadding: { top: padding, right: padding, bottom: padding, left: padding },
+        animated: true,
+      }),
+    moveTo: (region) => map.current?.animateToRegion(region, 300),
+  });
+  const view = useGroupView(db, groupId, uid);
   const isOwner = role === 'owner';
   // The rules deny the Join-request listing to everyone but the Owner, so nobody else asks for it.
   const requests = usePendingJoinRequests(db, groupId, isOwner);
@@ -62,12 +70,12 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
   // The refusal is authoritative: if the cap fired, show the full banner even before the live count lands.
   const full = queue.full || approveError === FULL_GROUP_MESSAGE;
   const [greetingVisible, setGreetingVisible] = useState(justJoined === true);
-  // The ⋯ menu, Invite someone and Join requests; the items built later (Members, Leave) land here.
-  const [panel, setPanel] = useState<'none' | 'menu' | 'invite' | 'joinRequests'>('none');
+  // The ⋯ menu: Members for everyone, the Owner's Join requests and Invite someone, and the panels they open.
+  const [panel, setPanel] = useState<'none' | 'menu' | 'members' | 'invite' | 'joinRequests'>('none');
 
   useEffect(() => {
-    firstCentre.current?.pins(pins);
-  }, [pins]);
+    firstFrame.current?.view(view);
+  }, [view]);
 
   // The welcome is one-off: it appears on the approval landing and disappears on its own (spec §7.3).
   useEffect(() => {
@@ -83,6 +91,12 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
     setDismissed((current) => new Set(current).add(banner.uid));
   }
 
+  // The recentre button and a tapped member row both move at the recentre zoom (spec §7.4).
+  const mine = view.pins.find((pin) => pin.mine);
+  function centreOn(position: { lat: number; lng: number }) {
+    map.current?.animateToRegion(neighbourhoodRegion(position.lat, position.lng), 300);
+  }
+
   return (
     <View style={StyleSheet.absoluteFill}>
       <MapView
@@ -90,9 +104,9 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
         style={StyleSheet.absoluteFill}
         initialRegion={PLACEHOLDER_REGION}
         mapType="standard"
-        onMapReady={() => firstCentre.current?.mapReady()}
+        onMapReady={() => firstFrame.current?.mapReady()}
       >
-        {pins.map((pin) => (
+        {view.pins.map((pin) => (
           <Marker
             key={pin.uid}
             coordinate={{ latitude: pin.lat, longitude: pin.lng }}
@@ -109,25 +123,73 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
       <View style={styles.header} pointerEvents="none">
         <Text style={styles.groupName}>{groupName}</Text>
       </View>
-      {/* The ⋯ menu holds the Owner's Join requests (when any are pending) and Invite someone, until the
-          Members and Leave items land; a non-Owner has nothing to open. */}
-      {isOwner && (
-        <Pressable
-          style={styles.menuButton}
-          accessibilityRole="button"
-          accessibilityLabel="Menu"
-          onPress={() => setPanel(panel === 'menu' ? 'none' : 'menu')}
-        >
-          <Text style={styles.menuButtonLabel}>⋯</Text>
-        </Pressable>
-      )}
 
-      {isOwner && panel === 'menu' && (
+      {/* The ⋯ menu: Members for everyone, the Owner's Join requests (when any are pending) and Invite
+          someone. Leave group arrives in ticket 11. */}
+      <Pressable
+        style={styles.menuButton}
+        accessibilityRole="button"
+        accessibilityLabel="Menu"
+        onPress={() => setPanel(panel === 'menu' ? 'none' : 'menu')}
+      >
+        <Text style={styles.menuButtonLabel}>⋯</Text>
+      </Pressable>
+
+      {/* The top stack: the "No one is sharing yet" line, the Owner's join-request banner, and the joiner's
+          welcome. They flow instead of overlapping when more than one applies. */}
+      <View style={styles.topStack} pointerEvents="box-none">
+        {view.nobodyElseSharing && (
+          <View style={styles.notice} pointerEvents="none">
+            <Text style={styles.noticeText}>No one is sharing yet. Ask them to open the app.</Text>
+          </View>
+        )}
+        {isOwner && banner && (
+          <View style={styles.joinBanner}>
+            <Text style={styles.joinBannerText}>{banner.displayName} wants to join this group.</Text>
+            {full && <Text style={styles.joinBannerFull}>{FULL_GROUP_MESSAGE}</Text>}
+            {!full && approveError && <Text style={styles.joinBannerError}>{approveError}</Text>}
+            <View style={styles.joinBannerActions}>
+              {!full &&
+                (approving === banner.uid ? (
+                  <ActivityIndicator />
+                ) : (
+                  <Button label="Approve" onPress={() => approve(banner.uid)} />
+                ))}
+              <Button label="Not now" onPress={notNow} />
+            </View>
+          </View>
+        )}
+        {greetingVisible && (
+          <View style={styles.welcome} pointerEvents="none">
+            <Text style={styles.welcomeText}>
+              Welcome, {yourName}. You are sharing your location with the family.
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {/* ⦿ Recentre: back to this phone at the recentre zoom. Disabled until this phone has a Position. */}
+      <Pressable
+        style={[styles.recentreButton, !mine && styles.recentreDisabled]}
+        accessibilityRole="button"
+        accessibilityLabel="Centre on me"
+        disabled={!mine}
+        onPress={() => {
+          if (mine) centreOn(mine);
+        }}
+      >
+        <Text style={styles.recentreLabel}>⦿</Text>
+      </Pressable>
+
+      {panel === 'menu' && (
         <>
           {/* Tapping anywhere off the menu dismisses it. */}
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setPanel('none')} />
           <View style={styles.menu}>
-            {queue.count > 0 && (
+            <Pressable style={styles.menuItem} accessibilityRole="button" onPress={() => setPanel('members')}>
+              <Text style={styles.menuItemLabel}>Members</Text>
+            </Pressable>
+            {isOwner && queue.count > 0 && (
               <Pressable
                 style={styles.menuItem}
                 accessibilityRole="button"
@@ -136,11 +198,27 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
                 <Text style={styles.menuItemLabel}>Join requests ({queue.count})</Text>
               </Pressable>
             )}
-            <Pressable style={styles.menuItem} accessibilityRole="button" onPress={() => setPanel('invite')}>
-              <Text style={styles.menuItemLabel}>Invite someone</Text>
-            </Pressable>
+            {isOwner && (
+              <Pressable style={styles.menuItem} accessibilityRole="button" onPress={() => setPanel('invite')}>
+                <Text style={styles.menuItemLabel}>Invite someone</Text>
+              </Pressable>
+            )}
           </View>
         </>
+      )}
+
+      {/* The panels are full-screen and come last, so they cover the map chrome while they are open. */}
+      {panel === 'members' && (
+        <View style={StyleSheet.absoluteFill}>
+          <Members
+            members={view.members}
+            onPick={(position) => {
+              if (position) centreOn(position);
+              setPanel('none');
+            }}
+            onClose={() => setPanel('none')}
+          />
+        </View>
       )}
 
       {panel === 'invite' && (
@@ -168,31 +246,6 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
             full={full}
             onClose={() => setPanel('none')}
           />
-        </View>
-      )}
-
-      {isOwner && banner && (
-        <View style={styles.joinBanner}>
-          <Text style={styles.joinBannerText}>{banner.displayName} wants to join this group.</Text>
-          {full && <Text style={styles.joinBannerFull}>{FULL_GROUP_MESSAGE}</Text>}
-          {!full && approveError && <Text style={styles.joinBannerError}>{approveError}</Text>}
-          <View style={styles.joinBannerActions}>
-            {!full &&
-              (approving === banner.uid ? (
-                <ActivityIndicator />
-              ) : (
-                <Button label="Approve" onPress={() => approve(banner.uid)} />
-              ))}
-            <Button label="Not now" onPress={notNow} />
-          </View>
-        </View>
-      )}
-
-      {greetingVisible && (
-        <View style={styles.welcome} pointerEvents="none">
-          <Text style={styles.welcomeText}>
-            Welcome, {yourName}. You are sharing your location with the family.
-          </Text>
         </View>
       )}
     </View>
@@ -246,6 +299,14 @@ const styles = StyleSheet.create({
   },
   menuItem: { paddingHorizontal: 16, paddingVertical: 12 },
   menuItemLabel: { fontSize: 16 },
+  topStack: { position: 'absolute', top: 104, left: 16, right: 16, gap: 12 },
+  notice: {
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  noticeText: { fontSize: 15, textAlign: 'center' },
   joinBanner: {
     ...TOP_BANNER,
     backgroundColor: 'white',
@@ -262,6 +323,24 @@ const styles = StyleSheet.create({
   joinBannerActions: { flexDirection: 'row', gap: 12 },
   welcome: { ...TOP_BANNER, backgroundColor: 'rgba(26,115,232,0.95)' },
   welcomeText: { color: 'white', fontSize: 16, fontWeight: '600', textAlign: 'center' },
+  recentreButton: {
+    position: 'absolute',
+    bottom: 32,
+    right: 16,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
+  },
+  recentreDisabled: { opacity: 0.4 },
+  recentreLabel: { fontSize: 24, fontWeight: '700' },
   pin: {
     backgroundColor: '#1a73e8',
     borderRadius: 12,
