@@ -24,6 +24,14 @@ _Avoid_: Password, key, secret, PIN
 A pending ask to become a member of a group, waiting for the owner's approval.
 _Avoid_: Application, signup
 
+**First run**:
+This phone in no Group, offering to create one or join one. A phone removed from its Group, or one that left, is back at First run.
+_Avoid_: Onboarding, welcome, setup
+
+**Waiting**:
+This phone with a pending Join request: not yet a Member, and sharing nothing.
+_Avoid_: Pending member, lobby
+
 **Position**:
 One member's whereabouts at one moment — coordinates, accuracy, and when it was last updated. Only the latest position per member exists; there are no trails.
 _Avoid_: Location, fix, ping, trail
