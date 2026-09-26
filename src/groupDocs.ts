@@ -50,12 +50,17 @@ export function positionsRef(db: Firestore, gid: string): CollectionReference {
   return collection(db, 'groups', gid, 'locations');
 }
 
-/** One phone's pending Join request. Unused until ticket 07 asks and ticket 08 approves. */
+/** One phone's Join request. */
 export function joinRequestRef(db: Firestore, gid: string, uid: string): DocumentReference {
   return doc(db, 'groups', gid, 'joinRequests', uid);
 }
 
-/** One Invite code's document. Unused until ticket 07 mints and rotates codes. */
+/** Every Join request in a Group: the Owner's banner listens to the whole set (spec §7.5). */
+export function joinRequestsRef(db: Firestore, gid: string): CollectionReference {
+  return collection(db, 'groups', gid, 'joinRequests');
+}
+
+/** One Invite code's document. */
 export function inviteRef(db: Firestore, code: string): DocumentReference {
   return doc(db, 'invites', code);
 }
@@ -164,4 +169,36 @@ export function addMintInvite(
   });
   batch.set(groupRef(db, gid), { activeInviteCode: code }, { merge: true });
   if (previousCode && previousCode !== code) batch.delete(inviteRef(db, previousCode));
+}
+
+/**
+ * Adds the Owner's approval of a Join request to `batch`: the request's `status` becomes `approved`
+ * (`approved(gid)` is what then lets that phone admit itself) and the Group's Invite code is rotated in
+ * the same batch (spec §5, §7.5). The replacement Invite is written before the old document is deleted
+ * (`addMintInvite`), so the code the joiner came through is closed the moment they are admitted. The
+ * caller commits once, so a half-done approval cannot leave an approved request behind a live old code.
+ */
+export function addApproveJoin(
+  batch: WriteBatch,
+  db: Firestore,
+  gid: string,
+  uid: string,
+  {
+    code,
+    groupName,
+    ownerName,
+    createdBy,
+    expiresAt,
+    previousCode,
+  }: {
+    code: string;
+    groupName: string;
+    ownerName: string;
+    createdBy: string;
+    expiresAt: Timestamp;
+    previousCode?: string | null;
+  },
+): void {
+  batch.update(joinRequestRef(db, gid, uid), { status: 'approved' });
+  addMintInvite(batch, db, gid, code, { groupName, ownerName, createdBy, expiresAt, previousCode });
 }

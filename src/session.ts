@@ -10,6 +10,7 @@ import {
 } from 'firebase/firestore';
 
 import {
+  addApproveJoin,
   addCreateGroup,
   addJoinMember,
   addJoinRequest,
@@ -17,17 +18,22 @@ import {
   groupRef,
   inviteRef,
   joinRequestRef,
+  joinRequestsRef,
   memberRef,
   newGroupId,
 } from './groupDocs';
 
-/** The Group this phone is in, with this phone's own Member name for its pin (spec §7.4). */
-export type Group = { id: string; name: string; displayName: string | null };
+/** The Group this phone is in, with this phone's own Member name and role for its pin and menu (spec §7.4). */
+export type Group = { id: string; name: string; displayName: string | null; role: MemberRole };
+
+/** The two roles a Member document can carry (spec §3): the Owner admits and the rest are members. */
+export type MemberRole = 'owner' | 'member';
 
 const GROUP_ID_KEY = 'groupId';
 const GROUP_NAME_KEY = 'groupName';
 const DISPLAY_NAME_KEY = 'displayName';
 const OWNER_NAME_KEY = 'ownerName';
+const ROLE_KEY = 'role';
 
 /**
  * What the stored groupId means at launch (spec §7.1): a Member (Map), a phone whose own Join request is
@@ -71,8 +77,9 @@ export async function createGroup(db: Firestore, uid: string, yourName: string, 
     [GROUP_ID_KEY, gid],
     [GROUP_NAME_KEY, name],
     [DISPLAY_NAME_KEY, displayName],
+    [ROLE_KEY, 'owner'],
   ]);
-  return { id: gid, name, displayName };
+  return { id: gid, name, displayName, role: 'owner' };
 }
 
 /**
@@ -83,12 +90,14 @@ export async function createGroup(db: Firestore, uid: string, yourName: string, 
  * Waiting, and with neither there is nothing to trust.
  */
 export async function loadStart(db: Firestore, uid: string): Promise<Start> {
-  const [[, groupId], [, storedName], [, storedDisplayName], [, storedOwnerName]] = await AsyncStorage.multiGet([
-    GROUP_ID_KEY,
-    GROUP_NAME_KEY,
-    DISPLAY_NAME_KEY,
-    OWNER_NAME_KEY,
-  ]);
+  const [[, groupId], [, storedName], [, storedDisplayName], [, storedOwnerName], [, storedRole]] =
+    await AsyncStorage.multiGet([
+      GROUP_ID_KEY,
+      GROUP_NAME_KEY,
+      DISPLAY_NAME_KEY,
+      OWNER_NAME_KEY,
+      ROLE_KEY,
+    ]);
   if (!groupId) return { kind: 'firstRun' };
 
   try {
@@ -98,7 +107,12 @@ export async function loadStart(db: Firestore, uid: string): Promise<Start> {
       if (!group.exists()) return { kind: 'firstRun' };
       return {
         kind: 'member',
-        group: { id: groupId, name: group.data().name, displayName: member.data()?.displayName ?? null },
+        group: {
+          id: groupId,
+          name: group.data().name,
+          displayName: member.data()?.displayName ?? null,
+          role: memberRole(member.data()?.role),
+        },
       };
     }
 
@@ -115,7 +129,15 @@ export async function loadStart(db: Firestore, uid: string): Promise<Start> {
     const code = (error as { code?: unknown }).code;
     if (code === 'unavailable') {
       if (storedDisplayName) {
-        return { kind: 'member', group: { id: groupId, name: storedName ?? '', displayName: storedDisplayName } };
+        return {
+          kind: 'member',
+          group: {
+            id: groupId,
+            name: storedName ?? '',
+            displayName: storedDisplayName,
+            role: memberRole(storedRole),
+          },
+        };
       }
       if (storedOwnerName) {
         return { kind: 'waiting', groupId, groupName: storedName ?? '', ownerName: storedOwnerName };
@@ -186,8 +208,11 @@ export async function becomeMember(
   addJoinMember(batch, db, groupId, uid, { displayName });
   await batch.commit();
 
-  await AsyncStorage.multiSet([[DISPLAY_NAME_KEY, displayName]]);
-  return { id: groupId, name: groupName, displayName };
+  await AsyncStorage.multiSet([
+    [DISPLAY_NAME_KEY, displayName],
+    [ROLE_KEY, 'member'],
+  ]);
+  return { id: groupId, name: groupName, displayName, role: 'member' };
 }
 
 /**
@@ -264,6 +289,60 @@ export function watchJoinRequest(
   );
 }
 
+/** One pending Join request, as the Owner's banner names it (spec §7.4): whose to approve, and who. */
+export type PendingJoinRequest = { uid: string; displayName: string };
+
+/**
+ * Follows every Join request in the Group for the Owner's banner (spec §7.4, §7.5): each snapshot reports
+ * only the requests still `pending`. The rules admit this listing to the Owner alone, so only the Owner's
+ * phone may subscribe. Returns the unsubscribe; a failed read is logged, not thrown into the UI.
+ */
+export function watchPendingJoinRequests(
+  db: Firestore,
+  groupId: string,
+  onChange: (requests: PendingJoinRequest[]) => void,
+): () => void {
+  return onSnapshot(
+    joinRequestsRef(db, groupId),
+    (snapshot) => {
+      onChange(
+        snapshot.docs
+          .filter((each) => each.data().status === 'pending')
+          .map((each) => ({
+            uid: each.id,
+            displayName: (each.data().displayName as string | undefined) ?? '',
+          })),
+      );
+    },
+    (error) => console.warn('[session] could not follow the Join requests', error),
+  );
+}
+
+/**
+ * The Owner's Approve (spec §5, §7.5): one batch marks the Join request `approved` and rotates the Invite
+ * code, the replacement written before the old document is deleted. No push is sent: the joiner's own
+ * request listener sees the change and writes its Member document.
+ */
+export async function approveJoinRequest(
+  db: Firestore,
+  ownerUid: string,
+  groupId: string,
+  requesterUid: string,
+  { groupName, ownerName }: { groupName: string; ownerName: string },
+): Promise<void> {
+  const previousCode = await activeInviteCode(db, groupId);
+  const batch = writeBatch(db);
+  addApproveJoin(batch, db, groupId, requesterUid, {
+    code: newInviteCode(),
+    groupName,
+    ownerName,
+    createdBy: ownerUid,
+    expiresAt: Timestamp.fromDate(new Date(Date.now() + INVITE_TTL_MS)),
+    previousCode,
+  });
+  await batch.commit();
+}
+
 /** Writes the replacement Invite, moves the Group's pointer, and deletes the old document, in one batch. */
 async function mintInvite(
   db: Firestore,
@@ -324,4 +403,9 @@ async function readOrNull(ref: DocumentReference): Promise<DocumentSnapshot | nu
 /** Whether an Invite's expiry is still in the future, judged on this phone's clock as spec §3 accepts. */
 function isLive(expiresAt: unknown): boolean {
   return expiresAt instanceof Timestamp && expiresAt.toMillis() > Date.now();
+}
+
+/** A Member document's role, read as `member` for anything that is not the Owner's (the safe fallback). */
+function memberRole(value: unknown): MemberRole {
+  return value === 'owner' ? 'owner' : 'member';
 }

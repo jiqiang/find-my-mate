@@ -8,12 +8,14 @@ import {
   Timestamp,
   updateDoc,
   writeBatch,
+  type Firestore,
 } from 'firebase/firestore';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { as, env, modular, useRulesEnvironment } from './fakes/rules';
+import { as, env, modular, sleep, useRulesEnvironment } from './fakes/rules';
 import { addMintInvite, groupRef, groupsRef, inviteRef, joinRequestRef, memberRef } from '../src/groupDocs';
 import {
+  approveJoinRequest,
   becomeMember,
   createGroup,
   ensureInvite,
@@ -21,7 +23,9 @@ import {
   loadStart,
   newInviteCode,
   rotateInvite,
+  watchPendingJoinRequests,
   type InviteCode,
+  type PendingJoinRequest,
 } from '../src/session';
 
 // Ways Create (ticket 05) could fail, written before src/session.ts:
@@ -64,6 +68,15 @@ import {
 // 28. A stored groupId with no Member and no request is treated as membership.
 // 29. A member relaunch loses the Group name or its own displayName.
 // 30. Offline, a member or a pending joiner is stranded instead of trusting the stored names.
+//
+// Ways the Owner's approval (ticket 08) could fail, written before the code:
+// 31. Approving leaves the Join request pending, so the joiner never lands on the map.
+// 32. Approving does not rotate the Invite code, so the code the joiner used stays live.
+// 33. Rotation leaves the old Invite document behind, deletes the replacement, or fails to move the pointer.
+// 34. The replacement Invite names the wrong Group, Owner or creator.
+// 35. A non-owner can approve, when only the Owner may.
+// 36. The Owner's pending-request watcher reports approved requests as pending, or misses a later one.
+// 37. The watcher reports another Group's requests, or survives its unsubscribe.
 
 const OWNER = 'owner-uid';
 const OTHER = 'joiner-uid';
@@ -331,7 +344,7 @@ describe('becomeMember', () => {
 
     const group = await becomeMember(as(OTHER), OTHER, groupId, 'The Smiths');
 
-    expect(group).toEqual({ id: groupId, name: 'The Smiths', displayName: 'Priya' });
+    expect(group).toEqual({ id: groupId, name: 'The Smiths', displayName: 'Priya', role: 'member' });
     const member = (await getDoc(memberRef(as(OTHER), groupId, OTHER))).data()!;
     expect(Object.keys(member).sort()).toEqual(['displayName', 'joinedAt', 'role']);
     expect(member.displayName).toBe('Priya');
@@ -341,12 +354,139 @@ describe('becomeMember', () => {
   });
 });
 
-/** Flips the joiner's own request to approved, outside the rules (the Owner's action lands in ticket 08). */
+/** Approves OTHER's pending request through the Owner's own action (ticket 08). */
 async function approveRequest(groupId: string): Promise<void> {
-  await env.withSecurityRulesDisabled(async (ctx) => {
-    await updateDoc(joinRequestRef(modular(ctx), groupId, OTHER), { status: 'approved' });
-  });
+  await approveJoinRequest(as(OWNER), OWNER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Sam' });
 }
+
+describe('approveJoinRequest', () => {
+  it('approves the request and rotates the code in one batch, leaving the replacement live', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+    const db = as(OWNER);
+
+    await approveJoinRequest(db, OWNER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Sam' });
+
+    expect((await getDoc(joinRequestRef(db, groupId, OTHER))).data()!.status).toBe('approved');
+    expect(await inviteExists(invite.code)).toBe(false);
+    const replacement = (await getDoc(groupRef(db, groupId))).data()!.activeInviteCode as string;
+    expect(replacement).not.toBe(invite.code);
+    const minted = (await getDoc(inviteRef(db, replacement))).data()!;
+    expect(minted.groupId).toBe(groupId);
+    expect(minted.groupName).toBe('The Smiths');
+    expect(minted.ownerName).toBe('Sam');
+    expect(minted.createdBy).toBe(OWNER);
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDocs(collection(modular(ctx), 'invites'))).size).toBe(1);
+    });
+  });
+
+  it('admits the joiner: the approved request lets them write their Member document', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+
+    await approveJoinRequest(as(OWNER), OWNER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Sam' });
+    const landed = await becomeMember(as(OTHER), OTHER, groupId, 'The Smiths');
+
+    expect(landed).toEqual({ id: groupId, name: 'The Smiths', displayName: 'Priya', role: 'member' });
+  });
+
+  it('is denied for a non-owner: the request stays pending', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+
+    await expect(
+      approveJoinRequest(as(STRANGER), STRANGER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Stranger' }),
+    ).rejects.toThrow();
+
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDoc(joinRequestRef(modular(ctx), groupId, OTHER))).data()!.status).toBe('pending');
+    });
+  });
+});
+
+describe('watchPendingJoinRequests', () => {
+  /** Starts the watcher and lets a test await the next list `match` accepts, or the current one. */
+  function watch(db: Firestore, groupId: string) {
+    const emissions: PendingJoinRequest[][] = [];
+    const waiters: Array<{
+      match: (requests: PendingJoinRequest[]) => boolean;
+      resolve: (requests: PendingJoinRequest[]) => void;
+    }> = [];
+    const stop = watchPendingJoinRequests(db, groupId, (requests) => {
+      emissions.push(requests);
+      for (let i = waiters.length - 1; i >= 0; i -= 1) {
+        if (!waiters[i].match(requests)) continue;
+        const [waiter] = waiters.splice(i, 1);
+        waiter.resolve(requests);
+      }
+    });
+    return {
+      waitFor(match: (requests: PendingJoinRequest[]) => boolean): Promise<PendingJoinRequest[]> {
+        const latest = emissions.at(-1);
+        if (latest && match(latest)) return Promise.resolve(latest);
+        return new Promise((resolve) => waiters.push({ match, resolve }));
+      },
+      get emissions() {
+        return emissions;
+      },
+      stop,
+    };
+  }
+
+  it('reports each pending request, drops it on approval, and follows the rest', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+    await joinGroup(as(STRANGER), STRANGER, invite.code, 'Alex');
+
+    const watcher = watch(as(OWNER), groupId);
+    await expect(watcher.waitFor((requests) => requests.length === 2)).resolves.toEqual(
+      expect.arrayContaining([
+        { uid: OTHER, displayName: 'Priya' },
+        { uid: STRANGER, displayName: 'Alex' },
+      ]),
+    );
+
+    const dropped = watcher.waitFor((requests) => requests.length === 1);
+    await approveJoinRequest(as(OWNER), OWNER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Sam' });
+    expect(await dropped).toEqual([{ uid: STRANGER, displayName: 'Alex' }]);
+
+    const emptied = watcher.waitFor((requests) => requests.length === 0);
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await deleteDoc(joinRequestRef(modular(ctx), groupId, STRANGER));
+    });
+    expect(await emptied).toEqual([]);
+
+    watcher.stop();
+  });
+
+  it('reports nothing to a non-owner: the rules deny the listing', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+
+    const seen: PendingJoinRequest[][] = [];
+    const stop = watchPendingJoinRequests(as(STRANGER), groupId, (requests) => seen.push(requests));
+    await sleep(300);
+
+    expect(seen).toEqual([]);
+    stop();
+  });
+
+  it('stops reporting once its unsubscribe runs', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+
+    const watcher = watch(as(OWNER), groupId);
+    await watcher.waitFor((requests) => requests.length === 1);
+    const reported = watcher.emissions.length;
+
+    watcher.stop();
+    await joinGroup(as(STRANGER), STRANGER, invite.code, 'Alex');
+    await sleep(200);
+
+    expect(watcher.emissions.length).toBe(reported);
+  });
+});
 
 describe('loadStart (spec §7.1)', () => {
   it('is First run when no groupId is stored', async () => {
@@ -357,7 +497,7 @@ describe('loadStart (spec §7.1)', () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
     expect(await loadStart(as(OWNER), OWNER)).toEqual({
       kind: 'member',
-      group: { id: created.id, name: 'The Smiths', displayName: 'Sam' },
+      group: { id: created.id, name: 'The Smiths', displayName: 'Sam', role: 'owner' },
     });
   });
 
@@ -367,7 +507,7 @@ describe('loadStart (spec §7.1)', () => {
 
     expect(await loadStart(as(OWNER), OWNER)).toEqual({
       kind: 'member',
-      group: { id: created.id, name: 'The Smiths', displayName: 'Samantha' },
+      group: { id: created.id, name: 'The Smiths', displayName: 'Samantha', role: 'owner' },
     });
   });
 
@@ -404,7 +544,7 @@ describe('loadStart (spec §7.1)', () => {
 
     expect(await loadStart(offline, OWNER)).toEqual({
       kind: 'member',
-      group: { id: created.id, name: 'The Smiths', displayName: 'Sam' },
+      group: { id: created.id, name: 'The Smiths', displayName: 'Sam', role: 'owner' },
     });
   });
 

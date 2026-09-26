@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { as, env, modular, useRulesEnvironment } from './fakes/rules';
 import {
+  addApproveJoin,
   addCreateGroup,
   addJoinMember,
   addJoinRequest,
@@ -13,6 +14,7 @@ import {
   groupsRef,
   inviteRef,
   joinRequestRef,
+  joinRequestsRef,
   memberRef,
   membersRef,
   newGroupId,
@@ -55,6 +57,7 @@ describe('the references', () => {
     expect(positionRef(db, GID, OTHER).path).toBe('groups/group-one/locations/other-uid');
     expect(positionsRef(db, GID).path).toBe('groups/group-one/locations');
     expect(joinRequestRef(db, GID, OTHER).path).toBe('groups/group-one/joinRequests/other-uid');
+    expect(joinRequestsRef(db, GID).path).toBe('groups/group-one/joinRequests');
     expect(inviteRef(db, CODE).path).toBe('invites/LIVE01');
   });
 });
@@ -253,6 +256,74 @@ describe('addJoinMember', () => {
     addJoinMember(batch, db, GID, OTHER, { displayName: 'Priya' });
 
     await expect(batch.commit()).rejects.toThrow();
+  });
+});
+
+// Ways the Owner's approval batch (ticket 08) could fail, written before addApproveJoin:
+//  1. The request's status is written as anything but 'approved', or with a stray field, which the rules deny.
+//  2. Approval and rotation are separate commits, so a half-done approval leaves an approved request with the
+//     old code still live, or an admitted joiner no new code can gate.
+//  3. The replacement Invite is written after the old document is deleted, so a moment has no live code.
+//  4. The old document is left behind, so two codes are live; or the pointer does not move to the replacement.
+//  5. The wrong request document is approved, or the wrong Group's pointer moves.
+describe('addApproveJoin', () => {
+  /** A Group with a live CODE and OTHER's pending request, seeded through the same builders the app uses. */
+  async function seedPendingRequest(): Promise<void> {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const db = modular(ctx);
+      const create = writeBatch(db);
+      addCreateGroup(create, db, GID, { ownerUid: OWNER, displayName: 'Sam', groupName: 'The Smiths' });
+      addMintInvite(create, db, GID, CODE, {
+        groupName: 'The Smiths',
+        ownerName: 'Sam',
+        createdBy: OWNER,
+        expiresAt: live(),
+      });
+      addJoinRequest(create, db, GID, OTHER, { displayName: 'Priya', inviteCode: CODE });
+      await create.commit();
+    });
+  }
+
+  it('marks the request approved and rotates the Invite in the one batch the rules accept', async () => {
+    await seedPendingRequest();
+    const db = as(OWNER);
+    const batch = writeBatch(db);
+    addApproveJoin(batch, db, GID, OTHER, {
+      code: OTHER_CODE,
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+      createdBy: OWNER,
+      expiresAt: live(),
+      previousCode: CODE,
+    });
+    await batch.commit();
+
+    expect((await getDoc(joinRequestRef(db, GID, OTHER))).data()!.status).toBe('approved');
+    expect((await getDoc(groupRef(db, GID))).data()!.activeInviteCode).toBe(OTHER_CODE);
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const invites = await getDocs(collection(modular(ctx), 'invites'));
+      expect(invites.docs.map((each) => each.id)).toEqual([OTHER_CODE]);
+    });
+  });
+
+  it('is denied for a non-owner', async () => {
+    await seedPendingRequest();
+    // A pending joiner, not the Owner: the rules deny both the request update and the Invite mint.
+    const db = as(OTHER);
+    const batch = writeBatch(db);
+    addApproveJoin(batch, db, GID, OTHER, {
+      code: OTHER_CODE,
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+      createdBy: OTHER,
+      expiresAt: live(),
+      previousCode: CODE,
+    });
+
+    await expect(batch.commit()).rejects.toThrow();
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      expect((await getDoc(joinRequestRef(modular(ctx), GID, OTHER))).data()!.status).toBe('pending');
+    });
   });
 });
 

@@ -218,6 +218,25 @@ describe('admitting a Member', () => {
   });
 });
 
+describe('the Owner’s view of Join requests', () => {
+  beforeEach(async () => {
+    await seedGroupWithMember();
+    await requestJoin(JOINER, CODE);
+  });
+
+  it('lets the Owner list the Group’s Join requests', async () => {
+    await assertSucceeds(getDocs(collection(as(OWNER), 'groups', GID, 'joinRequests')));
+  });
+
+  it('denies a Member listing the Group’s Join requests', async () => {
+    await assertFails(getDocs(collection(as(MEMBER), 'groups', GID, 'joinRequests')));
+  });
+
+  it('denies a Member approving another phone’s Join request', async () => {
+    await assertFails(updateDoc(requestRef(as(MEMBER), JOINER), { status: 'approved' }));
+  });
+});
+
 describe('Positions', () => {
   beforeEach(seedGroupWithMember);
 

@@ -21,7 +21,7 @@ export type Phase =
   | { name: 'error'; message: string }
   | { name: 'firstRun'; uid: string }
   | { name: 'waiting'; uid: string; groupId: string; groupName: string; ownerName: string }
-  | { name: 'sharing'; uid: string; group: Group };
+  | { name: 'sharing'; uid: string; group: Group; justJoined?: true };
 
 /** The signed-in phone, as the phase module needs it: the real Firebase signIn also returns a User. */
 export type SignIn = () => Promise<{ uid: string }>;
@@ -67,13 +67,17 @@ export function startPhases({ db, signIn }: PhasesOptions): Phases {
     stopWatching = undefined;
   };
 
-  /** Materialises the approved joiner's own Member document, then lands on the map (§7.1 row 3, §7.3). */
+  /**
+   * Materialises the approved joiner's own Member document, then lands on the map (§7.1 row 3, §7.3). The
+   * `justJoined` marks the one arrival the map greets: this phone only becomes a Member by being approved,
+   * so its first map gets the one-off banner; a later launch reads the Member document and lands without it.
+   */
   async function land(uid: string, groupId: string, groupName: string): Promise<void> {
     try {
       const group = await becomeMember(db, uid, groupId, groupName);
       if (stopped) return;
       clearWatch();
-      setPhase({ name: 'sharing', uid, group });
+      setPhase({ name: 'sharing', uid, group, justJoined: true });
     } catch (error) {
       console.warn('[phases] could not write this phone in as a Member', error);
       if (!stopped) setPhase({ name: 'error', message: String(error) });

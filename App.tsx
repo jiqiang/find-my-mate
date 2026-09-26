@@ -27,7 +27,7 @@ export default function App() {
     case 'waiting':
       return <Waiting ownerName={phase.ownerName} />;
     case 'sharing':
-      return <SharingScreen uid={phase.uid} group={phase.group} />;
+      return <SharingScreen uid={phase.uid} group={phase.group} justJoined={phase.justJoined} />;
   }
 }
 
@@ -35,12 +35,22 @@ export default function App() {
  * Once there is a Group and a Member, the app shell has one job: show the map or the blocked screen from
  * Sharing's gate answer (ADR 0001). Sharing itself listens to the foreground signal and re-checks the gate.
  */
-function SharingScreen({ uid, group }: { uid: string; group: Group }) {
+function SharingScreen({ uid, group, justJoined }: { uid: string; group: Group; justJoined?: boolean }) {
   const { gate, recheck } = useSharing({ db, groupId: group.id, uid, foreground: appStateForeground });
 
   if (gate === 'checking') return <Loading />;
   if (gate === 'granted') {
-    return <Map db={db} groupId={group.id} uid={uid} groupName={group.name} ownerName={group.displayName ?? ''} />;
+    return (
+      <Map
+        db={db}
+        groupId={group.id}
+        uid={uid}
+        groupName={group.name}
+        yourName={group.displayName ?? ''}
+        role={group.role}
+        justJoined={justJoined}
+      />
+    );
   }
   return <BlockedPermission reason={gate} onTryAgain={recheck} />;
 }

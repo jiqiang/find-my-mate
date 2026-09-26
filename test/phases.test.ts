@@ -1,10 +1,10 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { deleteDoc, disableNetwork, getDoc, Timestamp, updateDoc, writeBatch } from 'firebase/firestore';
+import { deleteDoc, disableNetwork, getDoc, Timestamp, writeBatch } from 'firebase/firestore';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { as, env, modular, sleep, useRulesEnvironment } from './fakes/rules';
 import { addCreateGroup, addMintInvite, joinRequestRef, memberRef } from '../src/groupDocs';
-import { joinGroup } from '../src/session';
+import { approveJoinRequest, joinGroup } from '../src/session';
 import { startPhases, type Phase, type Phases } from '../src/phases';
 
 // Ways the phase decision (ticket 15) could fail, written before src/phases.ts:
@@ -93,7 +93,7 @@ describe('startPhases', () => {
     expect(await decided(phases)).toEqual({
       name: 'sharing',
       uid: UID,
-      group: { id: GID, name: 'The Smiths', displayName: 'Sam' },
+      group: { id: GID, name: 'The Smiths', displayName: 'Sam', role: 'owner' },
     });
   });
 
@@ -153,7 +153,7 @@ describe('startPhases', () => {
     await sleep(50);
 
     expect(seen).toEqual([
-      { name: 'sharing', uid: UID, group: { id: GID, name: 'The Smiths', displayName: 'Sam' } },
+      { name: 'sharing', uid: UID, group: { id: GID, name: 'The Smiths', displayName: 'Sam', role: 'owner' } },
     ]);
   });
 });
@@ -280,11 +280,9 @@ function waitFor(phases: Phases, match: (phase: Phase) => boolean): Promise<Phas
   });
 }
 
-/** Flips the joiner's own Join request to approved, outside the rules (the Owner's action lands in ticket 08). */
+/** The Owner's approval (ticket 08), through the same action the app uses. */
 async function approve(uid = JOINER): Promise<void> {
-  await env.withSecurityRulesDisabled(async (ctx) => {
-    await updateDoc(joinRequestRef(modular(ctx), GID, uid), { status: 'approved' });
-  });
+  await approveJoinRequest(as(UID), UID, GID, uid, { groupName: 'The Smiths', ownerName: 'Sam' });
 }
 
 describe('the Waiting phase (spec §7.1 row 2)', () => {
@@ -379,7 +377,8 @@ describe('the Waiting phase (spec §7.1 row 2)', () => {
     expect(await landed).toEqual({
       name: 'sharing',
       uid: JOINER,
-      group: { id: GID, name: 'The Smiths', displayName: 'Priya' },
+      group: { id: GID, name: 'The Smiths', displayName: 'Priya', role: 'member' },
+      justJoined: true,
     });
     const member = (await getDoc(memberRef(as(JOINER), GID, JOINER))).data()!;
     expect(member.role).toBe('member');
@@ -397,7 +396,8 @@ describe('the Waiting phase (spec §7.1 row 2)', () => {
     expect(await decided(phases)).toEqual({
       name: 'sharing',
       uid: JOINER,
-      group: { id: GID, name: 'The Smiths', displayName: 'Priya' },
+      group: { id: GID, name: 'The Smiths', displayName: 'Priya', role: 'member' },
+      justJoined: true,
     });
     expect((await getDoc(memberRef(as(JOINER), GID, JOINER))).exists()).toBe(true);
     phases.stop();
