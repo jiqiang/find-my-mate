@@ -1,9 +1,6 @@
 import {
-  collection,
   disableNetwork,
-  doc,
   getDocs,
-  serverTimestamp,
   setDoc,
   Timestamp,
   writeBatch,
@@ -15,6 +12,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as osLocation from './fakes/expo-location';
 import { fakeForeground } from './fakes/foreground';
 import { as, env, modular, sleep, useRulesEnvironment, waitForSnapshot } from './fakes/rules';
+import {
+  addCreateGroup,
+  positionRef as groupPositionRef,
+  positionsRef as groupPositionsRef,
+} from '../src/groupDocs';
 import {
   checkLocationGate,
   publishLocation,
@@ -69,8 +71,8 @@ const STRANGER = 'stranger-uid';
 const READING = { lat: -33.8688, lng: 151.2093, accuracy: 12 };
 const OTHER_READING = { lat: -33.8711, lng: 151.2111, accuracy: 8 };
 
-const positionRef = (db: Firestore, uid: string) => doc(db, 'groups', GID, 'locations', uid);
-const positions = (db: Firestore) => collection(db, 'groups', GID, 'locations');
+const positionRef = (db: Firestore, uid: string) => groupPositionRef(db, GID, uid);
+const positions = (db: Firestore) => groupPositionsRef(db, GID);
 
 /**
  * Resolves with the stored Position the next time the server's view of it matches. Snapshots with the
@@ -88,18 +90,7 @@ beforeEach(async () => {
   await env.withSecurityRulesDisabled(async (ctx) => {
     const db = modular(ctx);
     const batch = writeBatch(db);
-    batch.set(doc(db, 'groups', GID), {
-      name: 'The Smiths',
-      ownerUid: MEMBER,
-      maxMembers: 4,
-      createdAt: serverTimestamp(),
-      activeInviteCode: null,
-    });
-    batch.set(doc(db, 'groups', GID, 'members', MEMBER), {
-      displayName: 'Sam',
-      role: 'owner',
-      joinedAt: serverTimestamp(),
-    });
+    addCreateGroup(batch, db, GID, { ownerUid: MEMBER, displayName: 'Sam', groupName: 'The Smiths' });
     await batch.commit();
   });
 });

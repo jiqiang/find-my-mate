@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs';
 import {
   disableNetwork,
-  doc,
   serverTimestamp,
   setDoc,
   Timestamp,
@@ -13,6 +12,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { as, env, modular, sleep, useRulesEnvironment, waitForSnapshot } from './fakes/rules';
+import { addCreateGroup, memberRef, positionRef } from '../src/groupDocs';
 import { subscribeToPins, type Pin } from '../src/pins';
 import { publishLocation } from '../src/location';
 
@@ -94,7 +94,7 @@ class PinWatch {
  * the only state in which the server's `updatedAt` has not landed. Rejects if the write settles first.
  */
 const pendingPosition = (db: Firestore, uid: string): Promise<DocumentData> =>
-  waitForSnapshot(doc(db, 'groups', GID, 'locations', uid), () => true, 'pending');
+  waitForSnapshot(positionRef(db, GID, uid), () => true, 'pending');
 
 /**
  * Captures the module's own 15-second beat so a test can fire it without waiting, which is how the age
@@ -120,24 +120,17 @@ beforeEach(async () => {
   await env.withSecurityRulesDisabled(async (ctx) => {
     const db = modular(ctx);
     const batch = writeBatch(db);
-    batch.set(doc(db, 'groups', GID), {
-      name: 'The Smiths',
-      ownerUid: MEMBER,
-      maxMembers: 4,
-      createdAt: serverTimestamp(),
-      activeInviteCode: null,
-    });
-    const members: [string, string, string][] = [
-      [MEMBER, 'Sam', 'owner'],
-      [PRIYA, 'Priya', 'member'],
-      [ALEX, 'Alex', 'member'],
-      [JORDAN, 'Jordan', 'member'],
+    addCreateGroup(batch, db, GID, { ownerUid: MEMBER, displayName: 'Sam', groupName: 'The Smiths' });
+    const otherMembers: [string, string][] = [
+      [PRIYA, 'Priya'],
+      [ALEX, 'Alex'],
+      [JORDAN, 'Jordan'],
     ];
-    for (const [uid, displayName, role] of members) {
-      batch.set(doc(db, 'groups', GID, 'members', uid), { displayName, role, joinedAt: serverTimestamp() });
+    for (const [uid, displayName] of otherMembers) {
+      batch.set(memberRef(db, GID, uid), { displayName, role: 'member', joinedAt: serverTimestamp() });
     }
     for (const [uid, reading] of Object.entries(SEEDED_POSITIONS)) {
-      batch.set(doc(db, 'groups', GID, 'locations', uid), {
+      batch.set(positionRef(db, GID, uid), {
         ...reading,
         updatedAt: Timestamp.fromMillis(BASE),
         mode: 'foreground',
@@ -183,7 +176,7 @@ describe('the Pins a Group hands out', () => {
     watch = new PinWatch(db, MEMBER, () => BASE);
     await watch.until((each) => each.length === 3);
 
-    await updateDoc(doc(db, 'groups', GID, 'members', PRIYA), { displayName: 'Priya P' });
+    await updateDoc(memberRef(db, GID, PRIYA), { displayName: 'Priya P' });
 
     const pins = await watch.until((each) => each.some((pin) => pin.uid === PRIYA && pin.displayName === 'Priya P'));
     expect(pins.find((pin) => pin.uid === PRIYA)?.displayName).toBe('Priya P');
@@ -256,7 +249,7 @@ describe('the Pins a Group hands out', () => {
 
     // Everything that would hand the map another list: a rename, another Position, and a callback that
     // was already in flight when the map closed — the beat, called by hand now that its timer is gone.
-    await updateDoc(doc(db, 'groups', GID, 'members', PRIYA), { displayName: 'Priya P' });
+    await updateDoc(memberRef(db, GID, PRIYA), { displayName: 'Priya P' });
     publishLocation(db, GID, MEMBER, { lat: -33.9, lng: 151.3, accuracy: 5 });
     beat();
     await sleep(500);
@@ -279,7 +272,7 @@ describe('the Pins a Group hands out', () => {
 
   it('drops a Position whose Member document is missing, rather than inventing a Member', async () => {
     await env.withSecurityRulesDisabled(async (ctx) => {
-      await setDoc(doc(modular(ctx), 'groups', GID, 'locations', GHOST), {
+      await setDoc(positionRef(modular(ctx), GID, GHOST), {
         lat: 51.5,
         lng: -0.12,
         accuracy: 5,

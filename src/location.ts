@@ -1,5 +1,7 @@
 import * as Location from 'expo-location';
-import { doc, serverTimestamp, setDoc, type Firestore } from 'firebase/firestore';
+import { serverTimestamp, setDoc, type Firestore } from 'firebase/firestore';
+
+import { positionRef } from './groupDocs';
 
 /** Where the OS says the phone is, at one moment: the coordinates and accuracy a Position is made of. */
 export type PositionReading = { lat: number; lng: number; accuracy: number };
@@ -39,7 +41,7 @@ export async function checkLocationGate(): Promise<LocationGate> {
  * Position anyway, so there is no error UI for a failed or queued write (§6).
  */
 export function publishLocation(db: Firestore, groupId: string, uid: string, reading: PositionReading): void {
-  void setDoc(doc(db, 'groups', groupId, 'locations', uid), {
+  void setDoc(positionRef(db, groupId, uid), {
     lat: reading.lat,
     lng: reading.lng,
     accuracy: reading.accuracy,

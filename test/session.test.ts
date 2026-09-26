@@ -3,7 +3,6 @@ import {
   collection,
   deleteDoc,
   disableNetwork,
-  doc,
   getDoc,
   getDocs,
   Timestamp,
@@ -12,6 +11,7 @@ import {
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { as, env, modular, useRulesEnvironment } from './fakes/rules';
+import { groupRef, groupsRef, memberRef } from '../src/groupDocs';
 import { createGroup, loadGroup } from '../src/session';
 
 // Ways Create (ticket 05) could fail, written before src/session.ts:
@@ -46,7 +46,7 @@ describe('createGroup', () => {
     expect(group.id).toMatch(/^[A-Za-z0-9]{20}$/);
     expect(await AsyncStorage.getItem('groupId')).toBe(group.id);
 
-    const groupSnap = await getDoc(doc(db, 'groups', group.id));
+    const groupSnap = await getDoc(groupRef(db, group.id));
     const g = groupSnap.data()!;
     expect(Object.keys(g).sort()).toEqual(['activeInviteCode', 'createdAt', 'maxMembers', 'name', 'ownerUid']);
     expect(g.name).toBe('The Smiths');
@@ -55,7 +55,7 @@ describe('createGroup', () => {
     expect(g.createdAt).toBeInstanceOf(Timestamp);
     expect(g.activeInviteCode).toBeNull();
 
-    const memberSnap = await getDoc(doc(db, 'groups', group.id, 'members', OWNER));
+    const memberSnap = await getDoc(memberRef(db, group.id, OWNER));
     const m = memberSnap.data()!;
     expect(Object.keys(m).sort()).toEqual(['displayName', 'joinedAt', 'role']);
     expect(m.displayName).toBe('Sam');
@@ -80,7 +80,7 @@ describe('createGroup', () => {
     await expect(createGroup(as(OWNER), OWNER, yourName, groupName)).rejects.toThrow();
     expect(await AsyncStorage.getItem('groupId')).toBeNull();
     await env.withSecurityRulesDisabled(async (ctx) => {
-      expect((await getDocs(collection(modular(ctx), 'groups'))).size).toBe(0);
+      expect((await getDocs(groupsRef(modular(ctx)))).size).toBe(0);
     });
   });
 
@@ -104,7 +104,7 @@ describe('loadGroup (relaunch)', () => {
 
   it('takes the name off the Member document, so a rename reaches the map', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
-    await updateDoc(doc(as(OWNER), 'groups', created.id, 'members', OWNER), { displayName: 'Samantha' });
+    await updateDoc(memberRef(as(OWNER), created.id, OWNER), { displayName: 'Samantha' });
 
     expect(await loadGroup(as(OWNER), OWNER)).toEqual({
       id: created.id,
@@ -121,7 +121,7 @@ describe('loadGroup (relaunch)', () => {
   it('returns null when the Member document has been deleted', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
     await env.withSecurityRulesDisabled(async (ctx) => {
-      await deleteDoc(doc(modular(ctx), 'groups', created.id, 'members', OWNER));
+      await deleteDoc(memberRef(modular(ctx), created.id, OWNER));
     });
     expect(await loadGroup(as(OWNER), OWNER)).toBeNull();
   });

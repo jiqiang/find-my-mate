@@ -1,12 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {
-  collection,
-  doc,
-  getDoc,
-  serverTimestamp,
-  writeBatch,
-  type Firestore,
-} from 'firebase/firestore';
+import { getDoc, writeBatch, type Firestore } from 'firebase/firestore';
+
+import { addCreateGroup, groupRef, memberRef, newGroupId } from './groupDocs';
 
 /** The Group this phone is in, with this phone's own Member name for its pin (spec §7.4). */
 export type Group = { id: string; name: string; displayName: string | null };
@@ -24,29 +19,18 @@ export async function createGroup(db: Firestore, uid: string, yourName: string, 
   const name = groupName.trim();
   if (!displayName || !name) throw new Error('Your name and Group name are both required.');
 
-  const groupRef = doc(collection(db, 'groups'));
+  const gid = newGroupId(db);
   const batch = writeBatch(db);
-  batch.set(groupRef, {
-    name,
-    ownerUid: uid,
-    maxMembers: 4,
-    createdAt: serverTimestamp(),
-    activeInviteCode: null,
-  });
-  batch.set(doc(groupRef, 'members', uid), {
-    displayName,
-    role: 'owner',
-    joinedAt: serverTimestamp(),
-  });
+  addCreateGroup(batch, db, gid, { ownerUid: uid, displayName, groupName: name });
   await batch.commit();
 
   // Only after the commit: a failed Create must not leave the phone pointing at a Group that doesn't exist.
   await AsyncStorage.multiSet([
-    [GROUP_ID_KEY, groupRef.id],
+    [GROUP_ID_KEY, gid],
     [GROUP_NAME_KEY, name],
     [DISPLAY_NAME_KEY, displayName],
   ]);
-  return { id: groupRef.id, name, displayName };
+  return { id: gid, name, displayName };
 }
 
 /**
@@ -64,8 +48,8 @@ export async function loadGroup(db: Firestore, uid: string): Promise<Group | nul
   if (!groupId) return null;
   try {
     const [group, member] = await Promise.all([
-      getDoc(doc(db, 'groups', groupId)),
-      getDoc(doc(db, 'groups', groupId, 'members', uid)),
+      getDoc(groupRef(db, groupId)),
+      getDoc(memberRef(db, groupId, uid)),
     ]);
     if (!group.exists() || !member.exists()) return null;
     return { id: groupId, name: group.data().name, displayName: member.data().displayName ?? null };

@@ -85,6 +85,7 @@ Keep it to these modules — this is the whole app:
 App.tsx           the phase switch: loading → firstRun | waiting | sharing; Sharing's gate picks map or blocked
 src/firebase.ts   initializeApp + initializeAuth (AsyncStorage persistence) + getFirestore
 src/session.ts    groupId in AsyncStorage; createGroup, join, approve, leave, removeMember, invite rotation
+src/groupDocs.ts  every groups/{id}/… and invites/{code} path, and the multi-document batches the rules' getAfter() needs; session.ts commits them
 src/location.ts   the Location gate, the Sharing lifecycle (foreground → watch/pause) and publishLocation() — the only Position writer
 src/foreground.ts the Foreground signal over AppState that the app shell injects into Sharing (ADR 0001)
 src/useSharing.ts the hook over Sharing — the UI's gate answer and Try again

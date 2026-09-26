@@ -1,10 +1,11 @@
 import {
-  collection,
   onSnapshot,
   type DocumentData,
   type Firestore,
   type Timestamp,
 } from 'firebase/firestore';
+
+import { membersRef, positionsRef } from './groupDocs';
 
 /** A stored Position, as `publishLocation` writes it: this module is its only reader. */
 type Position = {
@@ -80,7 +81,7 @@ export function subscribeToPins(
   };
 
   const stopMembers = onSnapshot(
-    collection(db, 'groups', groupId, 'members'),
+    membersRef(db, groupId),
     (snapshot) => {
       members = new Map(snapshot.docs.map((each) => [each.id, each.data().displayName ?? null]));
       emit();
@@ -90,7 +91,7 @@ export function subscribeToPins(
   );
 
   const stopPositions = onSnapshot(
-    collection(db, 'groups', groupId, 'locations'),
+    positionsRef(db, groupId),
     (snapshot) => {
       positions = new Map(snapshot.docs.map((each) => [each.id, positionFrom(each.data(), clock())]));
       emit();
