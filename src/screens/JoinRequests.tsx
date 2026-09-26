@@ -32,6 +32,8 @@ export default function JoinRequests({
   onClose,
 }: Props) {
   const { approve, approving, error } = useApproveJoin({ db, ownerUid: uid, groupId, groupName, ownerName });
+  // The refusal is authoritative: if the cap fired, show the full notice even before the live count lands.
+  const atCap = full || error === FULL_GROUP_MESSAGE;
 
   return (
     <View style={styles.screen}>
@@ -42,7 +44,7 @@ export default function JoinRequests({
         requests.map((request) => (
           <View key={request.uid} style={styles.row}>
             <Text style={styles.name}>{request.displayName}</Text>
-            {!full &&
+            {!atCap &&
               (approving === request.uid ? (
                 <ActivityIndicator />
               ) : (
@@ -51,8 +53,8 @@ export default function JoinRequests({
           </View>
         ))
       )}
-      {full && requests.length > 0 && <Text style={styles.full}>{FULL_GROUP_MESSAGE}</Text>}
-      {error && <Text style={styles.error}>{error}</Text>}
+      {atCap && requests.length > 0 && <Text style={styles.full}>{FULL_GROUP_MESSAGE}</Text>}
+      {!atCap && error && <Text style={styles.error}>{error}</Text>}
       <Button label="Close" onPress={onClose} />
     </View>
   );

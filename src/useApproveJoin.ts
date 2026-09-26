@@ -1,12 +1,12 @@
 import { useRef, useState } from 'react';
 import type { Firestore } from 'firebase/firestore';
 
-import { approveJoinRequest } from './session';
+import { approveJoinRequest, FULL_GROUP_MESSAGE } from './session';
 
 /**
- * The Owner's Approve, shared by the banner and the ⋯ → Join requests list (spec §7.5). It owns the one
- * in-flight action at a time and the failure message both surfaces show; the request leaves the queue on
- * its own, because the Owner's pending-request watcher drops it once it is approved.
+ * The Owner's Approve, shared by the banner and the ⋯ → Join requests list (spec §7.5). It owns the
+ * in-flight action and the failure message its surface shows; the request leaves the queue on its own,
+ * because the Owner's pending-request watcher drops it once it is approved.
  */
 export function useApproveJoin(options: {
   db: Firestore;
@@ -34,7 +34,9 @@ export function useApproveJoin(options: {
       await approveJoinRequest(db, ownerUid, groupId, requesterUid, { groupName, ownerName });
     } catch (e) {
       console.warn('[session] could not approve the Join request', e);
-      setError("Couldn't approve. Try again.");
+      // The cap refusal is the Owner's own message, not a failure to retry: keep it verbatim. It is what
+      // shows when the cap is hit before the live Member count has told the banner the Group is full.
+      setError(e instanceof Error && e.message === FULL_GROUP_MESSAGE ? FULL_GROUP_MESSAGE : "Couldn't approve. Try again.");
     } finally {
       inFlight.current = false;
       setApproving(null);

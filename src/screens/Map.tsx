@@ -59,6 +59,8 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
     groupName,
     ownerName: yourName,
   });
+  // The refusal is authoritative: if the cap fired, show the full banner even before the live count lands.
+  const full = queue.full || approveError === FULL_GROUP_MESSAGE;
   const [greetingVisible, setGreetingVisible] = useState(justJoined === true);
   // The ⋯ menu, Invite someone and Join requests; the items built later (Members, Leave) land here.
   const [panel, setPanel] = useState<'none' | 'menu' | 'invite' | 'joinRequests'>('none');
@@ -163,7 +165,7 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
             groupName={groupName}
             ownerName={yourName}
             requests={queue.requests}
-            full={queue.full}
+            full={full}
             onClose={() => setPanel('none')}
           />
         </View>
@@ -172,10 +174,10 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
       {isOwner && banner && (
         <View style={styles.joinBanner}>
           <Text style={styles.joinBannerText}>{banner.displayName} wants to join this group.</Text>
-          {queue.full && <Text style={styles.joinBannerFull}>{FULL_GROUP_MESSAGE}</Text>}
-          {approveError && <Text style={styles.joinBannerError}>{approveError}</Text>}
+          {full && <Text style={styles.joinBannerFull}>{FULL_GROUP_MESSAGE}</Text>}
+          {!full && approveError && <Text style={styles.joinBannerError}>{approveError}</Text>}
           <View style={styles.joinBannerActions}>
-            {!queue.full &&
+            {!full &&
               (approving === banner.uid ? (
                 <ActivityIndicator />
               ) : (
