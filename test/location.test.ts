@@ -21,7 +21,15 @@ import {
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as osLocation from './fakes/expo-location';
-import { checkLocationGate, publishLocation, startSharing, type Sharing } from '../src/location';
+import { fakeForeground } from './fakes/foreground';
+import {
+  checkLocationGate,
+  publishLocation,
+  startSharing,
+  type Foreground,
+  type LocationGate,
+  type Sharing,
+} from '../src/location';
 
 // Ways the location gate and the Position publisher (ticket 06) could fail, written before src/location.ts:
 //  1. A permission that has never been asked is never asked, so the phone can never show the map.
@@ -49,6 +57,17 @@ import { checkLocationGate, publishLocation, startSharing, type Sharing } from '
 // 17. lets the superseded watch publish a Position on the way out, which §6 forbids.
 // 18. leaves a watch live after the map closes, so the phone keeps publishing with no map on screen.
 // 19. has the sharing in flight twice over, so the caller has nothing to pause while it is still starting.
+//
+// Ways the Sharing could fail to own putting away and coming back (ticket 14), written before the code:
+// 20. Putting the phone away writes a Position on the way out.
+// 21. Coming back watches or publishes before the Location gate has answered.
+// 22. Coming back with the permission revoked, or services off, still watches or republishes the held reading.
+// 23. A return to the foreground shows the OS permission prompt again although it was answered long ago.
+// 24. recheck() after granting in Settings does not move the gate to granted, or asks the OS a second time.
+// 25. A gate check that throws falls through to sharing instead of reporting denied.
+// 26. Put away and brought back before the first watch resolves, it ends with more than one watch or heartbeat.
+// 27. stop() leaves a watch or a heartbeat live, or publishes after it.
+// 28. A Sharing with no granted gate watches at all, so sharing runs on an unanswered gate.
 
 const GID = 'group-one';
 const MEMBER = 'member-uid';
@@ -244,20 +263,48 @@ describe('publishLocation', () => {
   });
 });
 
+/** The gate settles after at least one await; wait until it is no longer 'checking'. */
+async function settledGate(sharing: Sharing): Promise<LocationGate> {
+  if (sharing.gate !== 'checking') return sharing.gate;
+  return new Promise((resolve) => {
+    const stop = sharing.subscribe((gate) => {
+      if (gate === 'checking') return;
+      stop();
+      resolve(gate);
+    });
+  });
+}
+
+/** The OS and Firestore both answer on later ticks; poll until the condition holds. */
+async function waitFor(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 200; i += 1) {
+    if (condition()) return;
+    await sleep(10);
+  }
+  throw new Error('the condition never became true within 2 s');
+}
+
 describe('startSharing', () => {
   let sharing: Sharing | undefined;
 
   afterEach(() => {
-    sharing?.pause();
+    sharing?.stop();
     sharing = undefined;
+    osLocation.releaseWatches();
+    osLocation.releasePermissionChecks();
     vi.restoreAllMocks();
   });
 
-  it('watches once at Accuracy.High, and publishes the first reading the OS reports at once', async () => {
-    const db = as(MEMBER);
-    sharing = await startSharing({ db, groupId: GID, uid: MEMBER });
+  const start = (db: Firestore, foreground: Foreground) =>
+    startSharing({ db, groupId: GID, uid: MEMBER, foreground });
 
-    expect(osLocation.liveWatches()).toHaveLength(1);
+  it('checks the Location gate at start, then watches once it is granted and publishes the first reading', async () => {
+    osLocation.grantedInSettings();
+    const db = as(MEMBER);
+    sharing = start(db, fakeForeground());
+
+    expect(await settledGate(sharing)).toBe('granted');
+    await waitFor(() => osLocation.liveWatches().length === 1);
     expect(osLocation.liveWatches()[0].options).toEqual({ accuracy: 4 });
 
     const published = nextPosition(db, (data) => data.lat === READING.lat);
@@ -266,159 +313,201 @@ describe('startSharing', () => {
     expect(await published).toMatchObject({ lat: READING.lat, lng: READING.lng, accuracy: READING.accuracy });
   });
 
-  it('heartbeats on a 30-second JS timer, publishing the reading it holds', async () => {
+  it('writes nothing on the way out, and holds no watch', async () => {
+    osLocation.grantedInSettings();
     const db = as(MEMBER);
-    const intervals = vi.spyOn(globalThis, 'setInterval');
-    sharing = await startSharing({ db, groupId: GID, uid: MEMBER });
-
+    const foreground = fakeForeground();
+    sharing = start(db, foreground);
+    await waitFor(() => osLocation.liveWatches().length === 1);
     const first = nextPosition(db, (data) => data.lat === READING.lat);
     osLocation.emit(READING);
     await first;
 
-    const beat = intervals.mock.calls.find(([, delay]) => delay === 30_000);
-    expect(beat, 'no 30-second JS timer was scheduled').toBeDefined();
+    foreground.set(false);
 
+    expect(osLocation.liveWatches()).toHaveLength(0);
     osLocation.emit(OTHER_READING);
     await sleep(150);
-    expect((await getDocs(positions(db))).docs[0].data().lat).toBe(READING.lat);
-
-    const beatPublished = nextPosition(db, (data) => data.lat === OTHER_READING.lat);
-    (beat![0] as () => void)();
-    expect(await beatPublished).toMatchObject({ lat: OTHER_READING.lat, lng: OTHER_READING.lng });
+    expect((await getDocs(positions(db))).docs.map((each) => each.data().lat)).toEqual([READING.lat]);
   });
 
-  it('writes nothing while backgrounded, and publishes the held reading at once on resume', async () => {
+  it('publishes the held reading at once when it comes back with the gate granted', async () => {
+    osLocation.grantedInSettings();
     const db = as(MEMBER);
-    sharing = await startSharing({ db, groupId: GID, uid: MEMBER });
+    const foreground = fakeForeground();
+    sharing = start(db, foreground);
+    await waitFor(() => osLocation.liveWatches().length === 1);
     const first = nextPosition(db, (data) => data.lat === READING.lat);
     osLocation.emit(READING);
     const stored = await first;
 
-    sharing.pause();
+    foreground.set(false);
+    const republished = nextPosition(db, (data) => !data.updatedAt.isEqual(stored.updatedAt));
+    foreground.set(true);
+
+    expect((await republished).lat).toBe(READING.lat);
+    expect(osLocation.liveWatches()).toHaveLength(1);
+  });
+
+  it('reports a permission revoked on coming back, and publishes nothing', async () => {
+    osLocation.grantedInSettings();
+    const db = as(MEMBER);
+    const foreground = fakeForeground();
+    sharing = start(db, foreground);
+    await waitFor(() => osLocation.liveWatches().length === 1);
+    const first = nextPosition(db, (data) => data.lat === READING.lat);
+    osLocation.emit(READING);
+    const stored = await first;
+
+    foreground.set(false);
+    osLocation.deniedInSettings();
+    foreground.set(true);
+
+    await waitFor(() => sharing?.gate === 'denied');
+    await sleep(200);
     expect(osLocation.liveWatches()).toHaveLength(0);
-    osLocation.emit(OTHER_READING);
-    await sleep(150);
-    expect((await getDocs(positions(db))).docs.map((each) => each.data().lat)).toEqual([READING.lat]);
-
-    const backInTheForeground = nextPosition(db, (data) => !data.updatedAt.isEqual(stored.updatedAt));
-    await sharing.resume();
-
-    expect((await backInTheForeground).lat).toBe(READING.lat);
-    expect(osLocation.liveWatches()).toHaveLength(1);
+    const storedAfter = await getDocs(positions(db));
+    expect(storedAfter.docs.map((each) => each.data().lat)).toEqual([READING.lat]);
+    expect(storedAfter.docs[0].data().updatedAt).toEqual(stored.updatedAt);
   });
 
-  it('holds one watch at a time, however often it resumes', async () => {
+  it('reports services off on coming back, and publishes nothing', async () => {
+    osLocation.grantedInSettings();
     const db = as(MEMBER);
-    sharing = await startSharing({ db, groupId: GID, uid: MEMBER });
+    const foreground = fakeForeground();
+    sharing = start(db, foreground);
+    await waitFor(() => osLocation.liveWatches().length === 1);
+    const first = nextPosition(db, (data) => data.lat === READING.lat);
+    osLocation.emit(READING);
+    const stored = await first;
 
-    await sharing.resume();
-    await sharing.resume();
+    foreground.set(false);
+    osLocation.setServices(false);
+    foreground.set(true);
 
-    expect(osLocation.liveWatches()).toHaveLength(1);
+    await waitFor(() => sharing?.gate === 'services-off');
+    await sleep(200);
+    expect(osLocation.liveWatches()).toHaveLength(0);
+    expect((await getDocs(positions(db))).docs[0].data().updatedAt).toEqual(stored.updatedAt);
   });
 
-  it('leaves no watch behind when the map closes while a watch is still being created', async () => {
+  it('recheck() after granting in Settings moves to granted without asking twice, and starts watching', async () => {
+    osLocation.promptDenies();
     const db = as(MEMBER);
+    sharing = start(db, fakeForeground());
+
+    expect(await settledGate(sharing)).toBe('denied');
+    expect(osLocation.os.prompts).toBe(1);
+    expect(osLocation.liveWatches()).toHaveLength(0);
+
+    osLocation.grantedInSettings();
+    await sharing.recheck();
+
+    expect(sharing.gate).toBe('granted');
+    expect(osLocation.os.prompts).toBe(1);
+    await waitFor(() => osLocation.liveWatches().length === 1);
+  });
+
+  it('reports denied when the gate check throws, and holds no watch', async () => {
+    osLocation.breakPermissionCheck();
+    sharing = start(as(MEMBER), fakeForeground());
+
+    expect(await settledGate(sharing)).toBe('denied');
+    expect(osLocation.liveWatches()).toHaveLength(0);
+  });
+
+  it('holds at most one watch and one heartbeat however often it is put away and brought back', async () => {
+    osLocation.grantedInSettings();
     osLocation.holdWatches();
-    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
-    osLocation.releaseWatches(); // The first watch arrives, and the map shares as usual.
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const foreground = fakeForeground();
+    sharing = start(as(MEMBER), foreground);
+    await waitFor(() => osLocation.liveWatches().length === 1); // The first watch is on its way.
+
+    for (let i = 0; i < 3; i += 1) {
+      foreground.set(false);
+      foreground.set(true);
+    }
+    await waitFor(() => osLocation.liveWatches().length > 1); // Superseding watches are on their way too.
+
+    osLocation.releaseWatches(); // The OS hands every subscription back at once.
+    await waitFor(() => osLocation.liveWatches().length === 1);
+    await sleep(50);
+
+    expect(osLocation.liveWatches()).toHaveLength(1);
+    expect(intervals.mock.calls.filter(([, delay]) => delay === 30_000)).toHaveLength(1);
+  });
+
+  it('holds no watch and writes nothing when put away before the first gate check answers', async () => {
+    osLocation.grantedInSettings();
+    osLocation.holdPermissionChecks();
+    const db = as(MEMBER);
+    const foreground = fakeForeground();
+    sharing = start(db, foreground);
+
+    foreground.set(false); // Put away while the gate is still being checked.
+    osLocation.releasePermissionChecks();
     await sleep(150);
 
-    osLocation.holdWatches(); // The map closes while the watch the resume asked for is on its way.
-    sharing.resume();
-    sharing.pause();
+    expect(osLocation.liveWatches()).toHaveLength(0);
+    expect((await getDocs(positions(db))).size).toBe(0);
+  });
+
+  it('watches once when put away and brought back before the first gate check answers', async () => {
+    osLocation.grantedInSettings();
+    osLocation.holdPermissionChecks();
+    const foreground = fakeForeground();
+    sharing = start(as(MEMBER), foreground);
+
+    foreground.set(false);
+    foreground.set(true); // The first check is now superseded by the return's.
+    osLocation.releasePermissionChecks(); // Both answers arrive at once.
+    await waitFor(() => osLocation.liveWatches().length === 1);
+    await sleep(50);
+
+    expect(osLocation.liveWatches()).toHaveLength(1);
+  });
+
+  it('stops watching on stop(), and writes nothing after it', async () => {
+    osLocation.grantedInSettings();
+    const db = as(MEMBER);
+    const foreground = fakeForeground();
+    sharing = start(db, foreground);
+    await waitFor(() => osLocation.liveWatches().length === 1);
+    const first = nextPosition(db, (data) => data.lat === READING.lat);
+    osLocation.emit(READING);
+    const stored = await first;
+
+    sharing.stop();
+
+    expect(osLocation.liveWatches()).toHaveLength(0);
+    // Even a return to the foreground and a fresh reading after stop() change nothing.
+    foreground.set(false);
+    foreground.set(true);
+    osLocation.emit(OTHER_READING);
+    await sleep(200);
+    const storedAfter = await getDocs(positions(db));
+    expect(storedAfter.docs.map((each) => each.data().lat)).toEqual([READING.lat]);
+    expect(storedAfter.docs[0].data().updatedAt).toEqual(stored.updatedAt);
+  });
+
+  it('leaves nothing live when stop() lands while the first watch is still on its way', async () => {
+    osLocation.grantedInSettings();
+    osLocation.holdWatches();
+    const db = as(MEMBER);
+    const foreground = fakeForeground();
+    sharing = start(db, foreground);
+    await waitFor(() => osLocation.liveWatches().length === 1);
+
+    foreground.set(false);
+    foreground.set(true);
+    sharing.stop();
+    osLocation.releaseWatches();
+    await sleep(150);
+
     osLocation.emit(READING);
     await sleep(150);
-    osLocation.releaseWatches();
-    await sleep(150);
-
     expect(osLocation.liveWatches()).toHaveLength(0);
     expect((await getDocs(positions(db))).size).toBe(0);
   });
 });
-
-/**
- * The OS takes a moment to hand back a subscription, and the phone can be put away and brought back
- * inside that window. Every test here starts the sharing and pauses it while the first watch is still
- * being set up, which the fake holds open.
- */
-describe('startSharing while the first watch is still on its way', () => {
-  let sharing: Sharing | undefined;
-
-  afterEach(() => {
-    sharing?.pause();
-    sharing = undefined;
-    osLocation.releaseWatches();
-    vi.restoreAllMocks();
-  });
-
-  it('writes nothing when the phone is put away before the first watch resolves', async () => {
-    const db = as(MEMBER);
-    osLocation.holdWatches();
-
-    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
-    sharing.pause();
-    osLocation.emit(READING); // The OS reports until the watch it is still setting up is removed.
-    await sleep(150);
-    osLocation.releaseWatches();
-    await sleep(150);
-
-    expect(osLocation.liveWatches()).toHaveLength(0);
-    expect((await getDocs(positions(db))).size).toBe(0);
-  });
-
-  it('holds exactly one watch and one heartbeat when the phone comes back before the first watch resolves', async () => {
-    const db = as(MEMBER);
-    osLocation.holdWatches();
-    const intervals = vi.spyOn(globalThis, 'setInterval');
-
-    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
-    sharing.pause();
-    sharing.resume();
-    osLocation.releaseWatches();
-    await sleep(150);
-
-    expect(osLocation.liveWatches()).toHaveLength(1);
-    expect(intervals.mock.calls.filter(([, delay]) => delay === 30_000)).toHaveLength(1);
-  });
-
-  it('holds one watch and one heartbeat however often the phone is put away and brought back', async () => {
-    const db = as(MEMBER);
-    osLocation.holdWatches();
-    const intervals = vi.spyOn(globalThis, 'setInterval');
-
-    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
-    sharing.pause();
-    sharing.resume();
-    sharing.pause();
-    sharing.resume();
-    osLocation.releaseWatches(); // Every watch the OS was setting up arrives at once.
-    await sleep(150);
-
-    expect(osLocation.liveWatches()).toHaveLength(1);
-    expect(intervals.mock.calls.filter(([, delay]) => delay === 30_000)).toHaveLength(1);
-  });
-
-  it('leaves nothing live and publishes nothing after the map closes', async () => {
-    const db = as(MEMBER);
-    osLocation.holdWatches();
-
-    sharing = startSharing({ db, groupId: GID, uid: MEMBER });
-    sharing.pause();
-    sharing.resume();
-    osLocation.releaseWatches(); // Both watches arrive; the superseded one removes itself.
-    await sleep(150);
-
-    const published = nextPosition(db, (data) => data.lat === READING.lat);
-    osLocation.emit(READING); // The watch that survived is the one publishing.
-    expect((await published).lat).toBe(READING.lat);
-
-    sharing.pause(); // The map closes.
-    osLocation.emit(OTHER_READING);
-    await sleep(150);
-
-    expect(osLocation.liveWatches()).toHaveLength(0);
-    expect((await getDocs(positions(db))).docs.map((each) => each.data().lat)).toEqual([READING.lat]);
-  });
-});
-

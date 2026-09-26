@@ -51,59 +51,96 @@ export function publishLocation(db: Firestore, groupId: string, uid: string, rea
 }
 
 /**
- * Location sharing while the map is open. The watch and the timer are started together, and both stop on
- * `pause()` without writing anything, which is what "backgrounding or locking the phone writes nothing"
- * means. `resume()` watches again and publishes the held reading at once.
- *
- * Every start is stamped with a generation, and a watch that arrives after a later pause or start removes
- * itself without publishing, so at most one watch and one heartbeat are live however the phone is put away
- * and brought back (spec §6).
+ * The foreground signal: whether the app is in front, and a way to hear when that changes. Two adapters
+ * implement it — one over React Native's AppState, one a fake in tests — which is the seam that lets
+ * Sharing's lifecycle run in Node (ADR 0001).
  */
-export type Sharing = {
-  pause(): void;
-  resume(): void;
+export type Foreground = {
+  isActive(): boolean;
+  subscribe(listener: (active: boolean) => void): () => void;
 };
 
-export type SharingOptions = { db: Firestore; groupId: string; uid: string };
+/** The gate's answer, plus the not-yet-answered state only the very first check passes through. */
+export type SharingGate = LocationGate | 'checking';
 
 /**
- * Starts watching while the map is open, publishing the first reading as soon as the OS reports one. The
- * Sharing comes back before the first watch does: the OS takes a moment, and the phone may be put away and
- * brought back inside that window, so the caller has to be able to pause what it started.
+ * Sharing is the one owner of "put away" and "came back" (ADR 0001). It listens to the foreground signal
+ * itself: on a return it checks the Location gate first, and only if the gate says granted does it watch
+ * again and publish the held reading at once. Put away — anything that is not `active` — stops the watch
+ * and heartbeat and writes nothing. `gate` and `subscribe` are the answer for the UI, `recheck()` is Try
+ * again, and `stop()` ends it for good.
  */
-export function startSharing({ db, groupId, uid }: SharingOptions): Sharing {
+export type Sharing = {
+  readonly gate: SharingGate;
+  subscribe(listener: (gate: SharingGate) => void): () => void;
+  recheck(): Promise<void>;
+  stop(): void;
+};
+
+export type SharingOptions = { db: Firestore; groupId: string; uid: string; foreground: Foreground };
+
+/**
+ * Starts sharing this phone's Position with the Group. Returns synchronously — before the first gate check
+ * and the first watch exist — so the caller can always `stop()` what it started.
+ *
+ * One epoch guards the whole lifecycle: every check and every watch captures it, and applies its effect
+ * only while it is still the newest. `stop()` and every put-away bump it, so a late gate answer or a late
+ * watch removes itself instead of publishing after the phone was put away or Sharing was stopped.
+ */
+export function startSharing({ db, groupId, uid, foreground }: SharingOptions): Sharing {
   let latest: PositionReading | undefined;
   let watcher: Location.LocationSubscription | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
-  // Bumped by every pause, so a watch that arrives after a pause removes itself instead of leaking.
-  let generation = 0;
+  let stopped = false;
+  let active = foreground.isActive();
+  let epoch = 0;
+  let gate: SharingGate = 'checking';
+
+  const listeners = new Set<(gate: SharingGate) => void>();
+
+  const setGate = (next: SharingGate) => {
+    if (gate === next) return;
+    gate = next;
+    for (const listener of listeners) listener(gate);
+  };
 
   const publish = () => {
     if (latest) publishLocation(db, groupId, uid, latest);
   };
 
-  const watch = async () => {
-    pause();
-    const mine = generation;
-    publish(); // The map opened, or the phone came back: the held reading goes out before any new one.
+  const stopWatch = () => {
+    watcher?.remove();
+    watcher = undefined;
+    if (timer) clearInterval(timer);
+    timer = undefined;
+  };
 
+  /** Watches under `myEpoch`, and publishes the held reading at once — the map opened, or the phone came back. */
+  const watch = async (myEpoch: number) => {
+    publish();
     let delivered = false;
-    const started = await Location.watchPositionAsync({ accuracy: Location.Accuracy.High }, ({ coords }) => {
-      // A superseded watch reports nothing, so a phone put away mid-start writes nothing on the way out.
-      if (mine !== generation) return;
-      latest = {
-        lat: coords.latitude,
-        lng: coords.longitude,
-        // A null accuracy is only possible on platforms this app never runs on; §3 stores a number.
-        accuracy: coords.accuracy ?? 0,
-      };
-      if (!delivered) {
-        delivered = true; // ...so the pin lands at once rather than at the first heartbeat.
-        publish();
-      }
-    });
+    let started: Location.LocationSubscription;
+    try {
+      started = await Location.watchPositionAsync({ accuracy: Location.Accuracy.High }, ({ coords }) => {
+        // A superseded watch reports nothing, so a phone put away mid-start writes nothing on the way out.
+        if (myEpoch !== epoch) return;
+        latest = {
+          lat: coords.latitude,
+          lng: coords.longitude,
+          // A null accuracy is only possible on platforms this app never runs on; §3 stores a number.
+          accuracy: coords.accuracy ?? 0,
+        };
+        if (!delivered) {
+          delivered = true; // ...so the pin lands at once rather than at the first heartbeat.
+          publish();
+        }
+      });
+    } catch (error) {
+      console.warn('[location] could not watch this phone', error);
+      return;
+    }
 
-    if (mine !== generation) {
+    if (myEpoch !== epoch || stopped) {
       started.remove();
       return;
     }
@@ -111,20 +148,56 @@ export function startSharing({ db, groupId, uid }: SharingOptions): Sharing {
     timer = setInterval(publish, PUBLISH_INTERVAL_MS);
   };
 
-  function pause(): void {
-    generation += 1;
-    watcher?.remove();
-    watcher = undefined;
-    if (timer) clearInterval(timer);
-    timer = undefined;
-  }
-
-  const resume = () => {
-    void watch().catch((error: unknown) => {
-      console.warn('[location] could not watch this phone', error);
-    });
+  /** Checks the gate, and watches only if it says granted and the phone is still in front (spec §6, §7.6). */
+  const checkGateAndWatch = async () => {
+    const myEpoch = ++epoch; // Supersede any earlier check or watch: this is the newest decision.
+    stopWatch(); // Hold no watch while the gate is unanswered.
+    let answer: LocationGate;
+    try {
+      answer = await checkLocationGate();
+    } catch (error) {
+      // Never fall through to sharing: an unanswered gate is not a granted one. Try again re-runs it.
+      console.warn('[location] could not check the location permission', error);
+      answer = 'denied';
+    }
+    if (stopped || myEpoch !== epoch) return;
+    setGate(answer);
+    if (answer === 'granted' && active) await watch(myEpoch);
   };
 
-  resume();
-  return { pause, resume };
+  const unsubscribe = foreground.subscribe((isActive) => {
+    if (stopped) return;
+    active = isActive;
+    if (isActive) {
+      void checkGateAndWatch();
+    } else {
+      epoch += 1; // Everything in flight is now superseded.
+      stopWatch(); // Nothing is written on the way out.
+    }
+  });
+
+  void checkGateAndWatch();
+
+  return {
+    get gate() {
+      return gate;
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    recheck() {
+      return stopped ? Promise.resolve() : checkGateAndWatch();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      epoch += 1;
+      stopWatch();
+      unsubscribe();
+      listeners.clear();
+    },
+  };
 }

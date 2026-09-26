@@ -1,9 +1,8 @@
 import { useEffect, useRef } from 'react';
-import { AppState, StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import type { Firestore } from 'firebase/firestore';
 
-import { startSharing } from '../location';
 import type { Pin } from '../pins';
 import { usePins } from '../usePins';
 
@@ -29,7 +28,6 @@ export default function Map({ db, groupId, uid, groupName }: Props) {
   const centred = useRef(false);
   const pins = usePins(db, groupId, uid);
   const mine = pins.find((pin) => pin.mine);
-  usePublishing(db, groupId, uid);
 
   useEffect(() => {
     // Centre on the first Pin this phone has, so its own pin is on screen as soon as there is one.
@@ -72,23 +70,6 @@ export default function Map({ db, groupId, uid, groupName }: Props) {
  */
 function label(pin: Pin): string {
   return pin.displayName ? `${pin.displayName} · ${pin.age}` : pin.age;
-}
-
-/** Shares this phone while the map is open, and writes nothing whenever the phone is put away (§6). */
-function usePublishing(db: Firestore, groupId: string, uid: string): void {
-  useEffect(() => {
-    // The Sharing is in hand before its first watch exists, so pausing it is never too early and this
-    // hook needs no guard of its own (ticket 18).
-    const sharing = startSharing({ db, groupId, uid });
-    const subscription = AppState.addEventListener('change', (state) => {
-      if (state === 'active') sharing.resume();
-      else sharing.pause();
-    });
-    return () => {
-      subscription.remove();
-      sharing.pause();
-    };
-  }, [db, groupId, uid]);
 }
 
 const styles = StyleSheet.create({

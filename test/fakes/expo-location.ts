@@ -68,6 +68,11 @@ export const os = {
   /** Watches still being set up: the OS is reporting from them but the app cannot remove them yet. */
   held: [] as Held[],
   holding: false,
+  /** When true, the permission check throws, as a broken OS would. */
+  broken: false,
+  /** Permission checks the OS is still answering: the app is suspended on the promise they hold. */
+  heldChecks: [] as ((permission: FakePermission) => void)[],
+  holdingChecks: false,
 };
 
 export function reset(): void {
@@ -78,6 +83,9 @@ export function reset(): void {
   os.watches = [];
   os.held = [];
   os.holding = false;
+  os.broken = false;
+  os.heldChecks = [];
+  os.holdingChecks = false;
 }
 
 /** The next time the OS prompt appears, the user grants it. */
@@ -101,6 +109,22 @@ export function deniedInSettings(): void {
 
 export function setServices(enabled: boolean): void {
   os.services = enabled;
+}
+
+/** The OS location service is unavailable: every gate check throws. */
+export function breakPermissionCheck(): void {
+  os.broken = true;
+}
+
+/** The OS starts answering a permission check and does not return until `releasePermissionChecks()`. */
+export function holdPermissionChecks(): void {
+  os.holdingChecks = true;
+}
+
+/** Answer every permission check the OS has been holding, with whatever the permission is now. */
+export function releasePermissionChecks(): void {
+  os.holdingChecks = false;
+  for (const release of os.heldChecks.splice(0)) release(os.permission);
 }
 
 /** One reading the OS reports, to every live watch — a watch still being set up reports like any other. */
@@ -145,6 +169,8 @@ export function releaseWatches(): void {
 }
 
 export async function getForegroundPermissionsAsync(): Promise<FakePermission> {
+  if (os.broken) throw new Error('the OS location service is unavailable');
+  if (os.holdingChecks) return new Promise((release) => os.heldChecks.push(release));
   return os.permission;
 }
 

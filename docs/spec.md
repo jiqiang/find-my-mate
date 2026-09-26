@@ -82,10 +82,12 @@ permission (§7.6), so this is satisfied by construction.
 Keep it to these modules — this is the whole app:
 
 ```
-App.tsx           the phase switch: loading → firstRun | waiting | map | blocked; nothing else
+App.tsx           the phase switch: loading → firstRun | waiting | sharing; Sharing's gate picks map or blocked
 src/firebase.ts   initializeApp + initializeAuth (AsyncStorage persistence) + getFirestore
 src/session.ts    groupId in AsyncStorage; createGroup, join, approve, leave, removeMember, invite rotation
-src/location.ts   the watchPositionAsync subscription and publishLocation() — the only Position writer
+src/location.ts   the Location gate, the Sharing lifecycle (foreground → watch/pause) and publishLocation() — the only Position writer
+src/foreground.ts the Foreground signal over AppState that the app shell injects into Sharing (ADR 0001)
+src/useSharing.ts the hook over Sharing — the UI's gate answer and Try again
 src/pins.ts       watches the Group's Members and Positions; hands out the Pins the map draws (§7.4)
 src/usePins.ts    the hook over it — the map renders what it hands back and holds no reading logic
 src/screens/      FirstRun, Join, Waiting, Map, BlockedPermission
