@@ -5,16 +5,19 @@ import type { JoinResult } from '../session';
 import Button from './Button';
 
 type Props = {
+  /** The one-off line a removed phone reads ("You're no longer in this group."), or none (spec §7.1 row 4). */
+  notice?: string;
   onCreate: (yourName: string, groupName: string) => Promise<void>;
   onJoin: (code: string, yourName: string) => Promise<JoinResult>;
 };
 
-export default function FirstRun({ onCreate, onJoin }: Props) {
+export default function FirstRun({ notice, onCreate, onJoin }: Props) {
   const [mode, setMode] = useState<'choose' | 'create' | 'join'>('choose');
 
   return (
     <View style={styles.screen}>
       <Text style={styles.title}>Find My Mate</Text>
+      {notice && <Text style={styles.notice}>{notice}</Text>}
       {mode === 'choose' ? (
         <>
           <Button label="Create a family group" onPress={() => setMode('create')} />
@@ -138,6 +141,7 @@ function JoinForm({ onJoin }: Pick<Props, 'onJoin'>) {
 const styles = StyleSheet.create({
   screen: { flex: 1, justifyContent: 'center', padding: 24, gap: 12 },
   title: { fontSize: 28, fontWeight: '600', textAlign: 'center', marginBottom: 24 },
+  notice: { fontSize: 17, textAlign: 'center', color: '#b00020', marginBottom: 16 },
   input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, fontSize: 17 },
   spinner: { padding: 14 },
   error: { color: '#b00020', textAlign: 'center' },

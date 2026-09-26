@@ -13,7 +13,7 @@ One admitted phone in a group, under a name the rest of the group sees. A member
 _Avoid_: User, account, device
 
 **Owner**:
-The member who created the group, and the only one who can admit, rename or remove members. There is exactly one, and they cannot leave.
+The member who created the group, the only one who can admit or remove members, and the only one who can rename a Member other than themselves. There is exactly one, they cannot leave, and a Member may rename themselves.
 _Avoid_: Admin, host, creator, project owner (a Firebase/Google account concern, not a group role)
 
 **Invite code**:

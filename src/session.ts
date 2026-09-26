@@ -4,6 +4,7 @@ import {
   getDocs,
   onSnapshot,
   Timestamp,
+  updateDoc,
   writeBatch,
   type DocumentReference,
   type DocumentSnapshot,
@@ -16,6 +17,7 @@ import {
   addJoinMember,
   addJoinRequest,
   addMintInvite,
+  addRemoval,
   groupRef,
   inviteRef,
   joinRequestRef,
@@ -41,13 +43,16 @@ const ROLE_KEY = 'role';
 /**
  * What the stored groupId means at launch (spec §7.1): a Member (Map), a phone whose own Join request is
  * still `pending` (Waiting), a phone whose request is `approved` but whose Member document has not been
- * written yet (the approved-while-closed case), or no Group at all (First run). The names a Waiting phone
- * needs come from storage, because the invite it joined through may already be gone (spec §7.2).
+ * written yet (the approved-while-closed case), a phone that stored a Member's role but whose Member
+ * document and Join request are both gone (removed, or left on another phone), or no Group at all (First
+ * run). The names a Waiting phone needs come from storage, because the invite it joined through may
+ * already be gone (spec §7.2).
  */
 export type Start =
   | { kind: 'member'; group: Group }
   | { kind: 'waiting'; groupId: string; groupName: string; ownerName: string }
   | { kind: 'approved'; groupId: string; groupName: string }
+  | { kind: 'removed' }
   | { kind: 'firstRun' };
 
 /** The answer to a join attempt: the Group to wait in, or the one failure the Join screen names. */
@@ -127,7 +132,10 @@ export async function loadStart(db: Firestore, uid: string): Promise<Start> {
     if (status === 'approved') {
       return { kind: 'approved', groupId, groupName: storedName ?? '' };
     }
-    return { kind: 'firstRun' };
+    // No Member document and no Join request: this phone is not in the Group. It is First run with the
+    // notice (spec §7.1 row 4) — the shape a removed phone relaunches into, and a phone that left on
+    // another install.
+    return { kind: 'removed' };
   } catch (error) {
     const code = (error as { code?: unknown }).code;
     if (code === 'unavailable') {
@@ -190,6 +198,9 @@ export async function joinGroup(
     [GROUP_NAME_KEY, data.groupName],
     [OWNER_NAME_KEY, data.ownerName],
   ]);
+  // A phone that joins is not a Member: drop any role and name it kept from an earlier membership, so an
+  // offline relaunch waits rather than falling back to a stale Member identity (spec §7.2).
+  await AsyncStorage.multiRemove([DISPLAY_NAME_KEY, ROLE_KEY]);
   return { ok: true, groupId: data.groupId, groupName: data.groupName, ownerName: data.ownerName };
 }
 
@@ -216,6 +227,66 @@ export async function becomeMember(
     [ROLE_KEY, 'member'],
   ]);
   return { id: groupId, name: groupName, displayName, role: 'member' };
+}
+
+/**
+ * Renames a Member (spec §7.4): `displayName` is the only field change the rules allow, so role and
+ * `joinedAt` are untouched. The Owner may rename anyone; a Member may rename only themselves. A blank name
+ * is refused before the write. Returns the trimmed name.
+ */
+export async function renameMember(
+  db: Firestore,
+  groupId: string,
+  uid: string,
+  displayName: string,
+): Promise<string> {
+  const name = displayName.trim();
+  if (!name) throw new Error('Your name is required.');
+  await updateDoc(memberRef(db, groupId, uid), { displayName: name });
+  return name;
+}
+
+/**
+ * Renames this phone's own Member (spec §7.4) and remembers the name, so an offline relaunch still reaches
+ * the map under it. The Owner renaming someone else does not come through here: that phone's stored name is
+ * not ours to change.
+ */
+export async function renameSelf(
+  db: Firestore,
+  groupId: string,
+  uid: string,
+  displayName: string,
+): Promise<string> {
+  const name = await renameMember(db, groupId, uid, displayName);
+  await AsyncStorage.setItem(DISPLAY_NAME_KEY, name);
+  return name;
+}
+
+/**
+ * Removes a Member (spec §5, §7.4): one batch deletes their Member document, Position and Join request.
+ * The Owner sends this for another Member; a Member removing themselves is {@link leaveGroup}. The rules
+ * allow exactly those two, and the freed slot can be approved into at once.
+ */
+export async function removeMember(db: Firestore, groupId: string, uid: string): Promise<void> {
+  const batch = writeBatch(db);
+  addRemoval(batch, db, groupId, uid);
+  await batch.commit();
+}
+
+/**
+ * Leaves the Group (spec §5, §7.5): the same removal batch, then the stored Group is forgotten so the next
+ * launch is First run with nothing pointing back. The rules deny the Owner this — they cannot delete their
+ * own Member document — and the menu does not offer it to them.
+ */
+export async function leaveGroup(db: Firestore, uid: string, groupId: string): Promise<void> {
+  await removeMember(db, groupId, uid);
+  await AsyncStorage.multiRemove([
+    GROUP_ID_KEY,
+    GROUP_NAME_KEY,
+    OWNER_NAME_KEY,
+    DISPLAY_NAME_KEY,
+    ROLE_KEY,
+  ]);
 }
 
 /**
@@ -289,6 +360,30 @@ export function watchJoinRequest(
       onChange(snapshot.data().status === 'approved' ? 'approved' : 'pending');
     },
     (error) => console.warn('[session] could not follow the Join request', error),
+  );
+}
+
+/**
+ * Follows whether this phone is still in the Group while it is on the map (spec §5). Its own Member
+ * document is not the signal: the Members rule keys on membership, so a removed phone's read comes back as
+ * a denial, not an absence. Its Join request is: the rule admits it by `requestUid == uid()`, so a deleted
+ * request reads as an absence, and removal deletes it. A cached view never counts — an empty local cache
+ * while offline must not read as removal — and a failed read is logged and ignored, because silence is
+ * never leaving (spec §6).
+ */
+export function watchMembership(
+  db: Firestore,
+  groupId: string,
+  uid: string,
+  onChange: (present: boolean) => void,
+): () => void {
+  return onSnapshot(
+    joinRequestRef(db, groupId, uid),
+    (snapshot) => {
+      if (snapshot.metadata.fromCache) return;
+      onChange(snapshot.exists());
+    },
+    (error) => console.warn('[session] could not follow this phone’s membership', error),
   );
 }
 

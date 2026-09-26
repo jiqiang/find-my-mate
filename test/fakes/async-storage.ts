@@ -14,6 +14,9 @@ const AsyncStorage = {
   async multiSet(pairs: readonly [string, string][]): Promise<void> {
     for (const [key, value] of pairs) store.set(key, value);
   },
+  async multiRemove(keys: readonly string[]): Promise<void> {
+    for (const key of keys) store.delete(key);
+  },
   async removeItem(key: string): Promise<void> {
     store.delete(key);
   },

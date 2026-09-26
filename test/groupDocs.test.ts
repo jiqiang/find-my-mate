@@ -10,6 +10,7 @@ import {
   addJoinMember,
   addJoinRequest,
   addMintInvite,
+  addRemoval,
   groupRef,
   groupsRef,
   inviteRef,
@@ -256,6 +257,82 @@ describe('addJoinMember', () => {
     addJoinMember(batch, db, GID, OTHER, { displayName: 'Priya' });
 
     await expect(batch.commit()).rejects.toThrow();
+  });
+});
+
+// Ways Remove-from-group / Leave's batch (ticket 11) could fail, written before addRemoval:
+//  1. Only the Member document is deleted, so a dead Position keeps a pin on every map.
+//  2. The Join request is left behind, so a removed phone's approved request still admits it back in.
+//  3. The three deletions are split across commits, so a half-done removal leaves a pin or a re-entry path.
+//  4. A non-owner removes another Member's documents, which the rules must deny.
+describe('addRemoval', () => {
+  /** OWNER's Group with OTHER admitted, holding a Position and an approved Join request, through the builders. */
+  async function seedMemberWithPosition(): Promise<void> {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const db = modular(ctx);
+      const batch = writeBatch(db);
+      addCreateGroup(batch, db, GID, { ownerUid: OWNER, displayName: 'Sam', groupName: 'The Smiths' });
+      addMintInvite(batch, db, GID, CODE, {
+        groupName: 'The Smiths',
+        ownerName: 'Sam',
+        createdBy: OWNER,
+        expiresAt: live(),
+      });
+      addJoinRequest(batch, db, GID, OTHER, { displayName: 'Priya', inviteCode: CODE });
+      addJoinMember(batch, db, GID, OTHER, { displayName: 'Priya' });
+      await batch.commit();
+      await setDoc(positionRef(db, GID, OTHER), {
+        lat: -33.8688,
+        lng: 151.2093,
+        accuracy: 12,
+        updatedAt: Timestamp.now(),
+        mode: 'foreground',
+      });
+    });
+  }
+
+  /** Which of OTHER's three documents remain, read outside the rules so a deleted one is an absence, not a denial. */
+  async function remaining(other = OTHER): Promise<{ member: boolean; position: boolean; request: boolean }> {
+    let result = { member: true, position: true, request: true };
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      const db = modular(ctx);
+      result = {
+        member: (await getDoc(memberRef(db, GID, other))).exists(),
+        position: (await getDoc(positionRef(db, GID, other))).exists(),
+        request: (await getDoc(joinRequestRef(db, GID, other))).exists(),
+      };
+    });
+    return result;
+  }
+
+  it('deletes the Member, their Position and their Join request in the one batch the rules accept', async () => {
+    await seedMemberWithPosition();
+    const db = as(OWNER);
+    const batch = writeBatch(db);
+    addRemoval(batch, db, GID, OTHER);
+    await batch.commit();
+
+    expect(await remaining()).toEqual({ member: false, position: false, request: false });
+  });
+
+  it('lets a Member remove only themselves', async () => {
+    await seedMemberWithPosition();
+    const db = as(OTHER);
+    const batch = writeBatch(db);
+    addRemoval(batch, db, GID, OTHER);
+    await batch.commit();
+
+    expect(await remaining()).toEqual({ member: false, position: false, request: false });
+  });
+
+  it('is denied for a Member removing someone else', async () => {
+    await seedMemberWithPosition();
+    const db = as(OTHER);
+    const batch = writeBatch(db);
+    addRemoval(batch, db, GID, OWNER);
+
+    await expect(batch.commit()).rejects.toThrow();
+    expect(await remaining(OWNER)).toEqual({ member: true, position: false, request: false });
   });
 });
 

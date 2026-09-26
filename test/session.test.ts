@@ -5,6 +5,8 @@ import {
   disableNetwork,
   getDoc,
   getDocs,
+  serverTimestamp,
+  setDoc,
   Timestamp,
   updateDoc,
   writeBatch,
@@ -13,7 +15,7 @@ import {
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { as, env, modular, sleep, useRulesEnvironment } from './fakes/rules';
-import { addJoinMember, addMintInvite, groupRef, groupsRef, inviteRef, joinRequestRef, memberRef } from '../src/groupDocs';
+import { addJoinMember, addMintInvite, groupRef, groupsRef, inviteRef, joinRequestRef, memberRef, positionRef } from '../src/groupDocs';
 import {
   approveJoinRequest,
   becomeMember,
@@ -21,8 +23,12 @@ import {
   ensureInvite,
   FULL_GROUP_MESSAGE,
   joinGroup,
+  leaveGroup,
   loadStart,
   newInviteCode,
+  removeMember,
+  renameMember,
+  renameSelf,
   rotateInvite,
   watchMemberCount,
   watchPendingJoinRequests,
@@ -363,6 +369,148 @@ describe('becomeMember', () => {
   });
 });
 
+/**
+ * OWNER's Group with OTHER admitted and holding a Position, and the Group's live Invite afterwards (approval
+ * rotates it). Storage is cleared, so the caller stands in for a different phone.
+ */
+async function groupWithMember(): Promise<{ groupId: string; invite: InviteCode }> {
+  const { groupId, invite: opened } = await groupWithInvite();
+  await joinGroup(as(OTHER), OTHER, opened.code, 'Priya');
+  await approveRequest(groupId);
+  await becomeMember(as(OTHER), OTHER, groupId, 'The Smiths');
+  await setDoc(positionRef(as(OTHER), groupId, OTHER), {
+    lat: -33.8688,
+    lng: 151.2093,
+    accuracy: 12,
+    updatedAt: serverTimestamp(),
+    mode: 'foreground',
+  });
+  // Approval rotated the code; hand the caller the live replacement.
+  const invite = await ensureInvite(as(OWNER), OWNER, groupId, { groupName: 'The Smiths', ownerName: 'Sam' });
+  await AsyncStorage.clear();
+  return { groupId, invite };
+}
+
+// Ways Rename (ticket 11) could fail, written before the code:
+//  1. Rename changes role or joinedAt as well as displayName, which the rules deny.
+//  2. A Member renames another Member, which the rules must deny.
+//  3. A blank name is accepted, or writes anything.
+//  4. Renaming yourself does not remember the new name, so an offline relaunch shows the old one.
+//  5. The Owner renaming another Member overwrites the Owner's own stored name.
+describe('renameMember / renameSelf', () => {
+  it('renames your own Member, changing displayName only, and remembers the name', async () => {
+    const { groupId } = await groupWithMember();
+    const db = as(OTHER);
+
+    await renameSelf(db, groupId, OTHER, '  Priya S ');
+
+    const member = (await getDoc(memberRef(db, groupId, OTHER))).data()!;
+    expect(Object.keys(member).sort()).toEqual(['displayName', 'joinedAt', 'role']);
+    expect(member.displayName).toBe('Priya S');
+    expect(member.role).toBe('member');
+    expect(await AsyncStorage.getItem('displayName')).toBe('Priya S');
+  });
+
+  it('lets the Owner rename another Member without touching the Owner’s own stored name', async () => {
+    const { groupId } = await groupWithMember();
+    const db = as(OWNER);
+    await AsyncStorage.setItem('displayName', 'Sam');
+
+    await renameMember(db, groupId, OTHER, 'Priya S');
+
+    expect((await getDoc(memberRef(db, groupId, OTHER))).data()!.displayName).toBe('Priya S');
+    expect(await AsyncStorage.getItem('displayName')).toBe('Sam');
+  });
+
+  it('denies a Member renaming another Member', async () => {
+    const { groupId } = await groupWithMember();
+
+    await expect(renameMember(as(OTHER), groupId, OWNER, 'Nope')).rejects.toThrow();
+
+    expect((await getDoc(memberRef(as(OWNER), groupId, OWNER))).data()!.displayName).toBe('Sam');
+  });
+
+  it('rejects a blank name and writes nothing', async () => {
+    const { groupId } = await groupWithMember();
+
+    await expect(renameMember(as(OTHER), groupId, OTHER, '   ')).rejects.toThrow();
+
+    expect((await getDoc(memberRef(as(OWNER), groupId, OTHER))).data()!.displayName).toBe('Priya');
+  });
+});
+
+// Ways Remove from group (ticket 11) could fail, written before the code:
+//  6. The Member's Position or Join request survives, keeping a dead pin or a way back in.
+//  7. A non-owner removes someone else, which the rules must deny.
+//  8. The freed slot cannot be approved into.
+//  9. A removed phone can admit itself back without a fresh approval.
+describe('removeMember', () => {
+  it('deletes the Member, Position and Join request, freeing the slot for a fresh approval', async () => {
+    const { groupId, invite } = await groupWithMember();
+
+    await removeMember(as(OWNER), groupId, OTHER);
+
+    const db = as(OWNER);
+    expect((await getDoc(memberRef(db, groupId, OTHER))).exists()).toBe(false);
+    expect((await getDoc(positionRef(db, groupId, OTHER))).exists()).toBe(false);
+    expect((await getDoc(joinRequestRef(db, groupId, OTHER))).exists()).toBe(false);
+
+    await joinGroup(as(STRANGER), STRANGER, invite.code, 'Alex');
+    await approveJoinRequest(db, OWNER, groupId, STRANGER, { groupName: 'The Smiths', ownerName: 'Sam' });
+    expect((await getDoc(joinRequestRef(db, groupId, STRANGER))).data()!.status).toBe('approved');
+  });
+
+  it('denies a Member removing someone else', async () => {
+    const { groupId } = await groupWithMember();
+
+    await expect(removeMember(as(OTHER), groupId, OWNER)).rejects.toThrow();
+
+    expect((await getDoc(memberRef(as(OTHER), groupId, OWNER))).exists()).toBe(true);
+  });
+
+  it('cannot admit itself back: with no approved request, becomeMember is denied', async () => {
+    const { groupId } = await groupWithMember();
+
+    await removeMember(as(OWNER), groupId, OTHER);
+
+    await expect(becomeMember(as(OTHER), OTHER, groupId, 'The Smiths')).rejects.toThrow();
+    expect((await getDoc(memberRef(as(OWNER), groupId, OTHER))).exists()).toBe(false);
+  });
+});
+
+// Ways Leave group (ticket 11) could fail, written before the code:
+// 10. The stored groupId is not cleared, so a relaunch stays pointed at the Group.
+// 11. The Member document, Position or Join request survives, so the phone is still half in.
+// 12. The Owner can leave, which the rules must deny.
+describe('leaveGroup', () => {
+  it('deletes the three documents and clears the stored Group', async () => {
+    const { groupId } = await groupWithMember();
+    await AsyncStorage.multiSet([
+      ['groupId', groupId],
+      ['groupName', 'The Smiths'],
+      ['displayName', 'Priya'],
+      ['role', 'member'],
+    ]);
+
+    await leaveGroup(as(OTHER), OTHER, groupId);
+
+    const db = as(OWNER);
+    expect((await getDoc(memberRef(db, groupId, OTHER))).exists()).toBe(false);
+    expect((await getDoc(positionRef(db, groupId, OTHER))).exists()).toBe(false);
+    expect((await getDoc(joinRequestRef(db, groupId, OTHER))).exists()).toBe(false);
+    expect(await AsyncStorage.getItem('groupId')).toBeNull();
+    expect(await loadStart(as(OTHER), OTHER)).toEqual({ kind: 'firstRun' });
+  });
+
+  it('denies the Owner leaving: the rules refuse deleting their own Member document', async () => {
+    const { groupId } = await groupWithMember();
+
+    await expect(leaveGroup(as(OWNER), OWNER, groupId)).rejects.toThrow();
+
+    expect((await getDoc(memberRef(as(OWNER), groupId, OWNER))).exists()).toBe(true);
+  });
+});
+
 /** Approves OTHER's pending request through the Owner's own action (ticket 08). */
 async function approveRequest(groupId: string): Promise<void> {
   await approveJoinRequest(as(OWNER), OWNER, groupId, OTHER, { groupName: 'The Smiths', ownerName: 'Sam' });
@@ -605,8 +753,36 @@ describe('loadStart (spec §7.1)', () => {
 
   it('is First run when this phone is not a Member and has no request', async () => {
     const created = await createGroup(as(OWNER), OWNER, 'Sam', 'The Smiths');
+    // The Owner's Create stored on the Owner's phone; a stranger's phone has its own empty storage.
+    await AsyncStorage.clear();
     expect(await loadStart(as(STRANGER), STRANGER)).toEqual({ kind: 'firstRun' });
     expect(created.id).toBeTruthy();
+  });
+
+  it('is removed when a stored Member’s document is gone and no request remains', async () => {
+    const { groupId } = await groupWithMember();
+    // A real Member stores its role and name; a removed phone keeps them, which is what marks it removed.
+    await AsyncStorage.multiSet([
+      ['groupId', groupId],
+      ['groupName', 'The Smiths'],
+      ['displayName', 'Priya'],
+      ['role', 'member'],
+    ]);
+
+    await removeMember(as(OWNER), groupId, OTHER);
+
+    expect(await loadStart(as(OTHER), OTHER)).toEqual({ kind: 'removed' });
+  });
+
+  it('is removed (row 4) when the stored Group has no Member and no request, with or without a stored role', async () => {
+    const { groupId, invite } = await groupWithInvite();
+    await joinGroup(as(OTHER), OTHER, invite.code, 'Priya');
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await deleteDoc(joinRequestRef(modular(ctx), groupId, OTHER));
+    });
+
+    // Join stored only groupId/groupName/ownerName; row 4 does not wait for a stored role.
+    expect(await loadStart(as(OTHER), OTHER)).toEqual({ kind: 'removed' });
   });
 
   it('is Waiting when the stored Group’s own Join request is pending, naming the Owner from storage', async () => {

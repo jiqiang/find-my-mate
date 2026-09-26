@@ -314,3 +314,25 @@ describe('leaving', () => {
     await assertFails(deleteDoc(positionRef(as(MEMBER), OWNER)));
   });
 });
+
+// Rename is one field: displayName. The rule that matters is who may do it to whom.
+describe('renaming a Member', () => {
+  beforeEach(seedGroupWithMember);
+
+  it('lets a Member rename themselves', async () => {
+    await assertSucceeds(updateDoc(memberRef(as(MEMBER), MEMBER), { displayName: 'Priya S' }));
+  });
+
+  it('lets the Owner rename another Member', async () => {
+    await assertSucceeds(updateDoc(memberRef(as(OWNER), MEMBER), { displayName: 'Priya S' }));
+  });
+
+  it('denies a Member renaming another Member', async () => {
+    await assertFails(updateDoc(memberRef(as(MEMBER), OWNER), { displayName: 'Nope' }));
+  });
+
+  it('denies anyone changing a Member’s role', async () => {
+    await assertFails(updateDoc(memberRef(as(MEMBER), MEMBER), { role: 'owner' }));
+    await assertFails(updateDoc(memberRef(as(OWNER), MEMBER), { role: 'owner' }));
+  });
+});

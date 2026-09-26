@@ -15,7 +15,7 @@ import { useSharing } from './src/useSharing';
  * `src/phases.ts` (spec §7.1), including Create moving First run to sharing and Join moving it to Waiting.
  */
 export default function App() {
-  const { phase, createGroup, join } = usePhase({ db, signIn });
+  const { phase, createGroup, join, leave } = usePhase({ db, signIn });
 
   switch (phase.name) {
     case 'loading':
@@ -23,11 +23,13 @@ export default function App() {
     case 'error':
       return <Loading error={phase.message} />;
     case 'firstRun':
-      return <FirstRun onCreate={createGroup} onJoin={join} />;
+      return <FirstRun notice={phase.notice} onCreate={createGroup} onJoin={join} />;
     case 'waiting':
       return <Waiting ownerName={phase.ownerName} />;
     case 'sharing':
-      return <SharingScreen uid={phase.uid} group={phase.group} justJoined={phase.justJoined} />;
+      return (
+        <SharingScreen uid={phase.uid} group={phase.group} justJoined={phase.justJoined} onLeave={leave} />
+      );
   }
 }
 
@@ -35,7 +37,17 @@ export default function App() {
  * Once there is a Group and a Member, the app shell has one job: show the map or the blocked screen from
  * Sharing's gate answer (ADR 0001). Sharing itself listens to the foreground signal and re-checks the gate.
  */
-function SharingScreen({ uid, group, justJoined }: { uid: string; group: Group; justJoined?: boolean }) {
+function SharingScreen({
+  uid,
+  group,
+  justJoined,
+  onLeave,
+}: {
+  uid: string;
+  group: Group;
+  justJoined?: boolean;
+  onLeave: () => Promise<void>;
+}) {
   const { gate, recheck } = useSharing({ db, groupId: group.id, uid, foreground: appStateForeground });
 
   if (gate === 'checking') return <Loading />;
@@ -49,6 +61,7 @@ function SharingScreen({ uid, group, justJoined }: { uid: string; group: Group; 
         yourName={group.displayName ?? ''}
         role={group.role}
         justJoined={justJoined}
+        onLeave={onLeave}
       />
     );
   }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
 import type { Firestore } from 'firebase/firestore';
 
@@ -38,9 +38,11 @@ type Props = {
   yourName: string;
   role: MemberRole;
   justJoined?: boolean;
+  /** The Member's own Leave (spec §7.5): the batch, clearing the stored Group, then First run. */
+  onLeave: () => Promise<void>;
 };
 
-export default function Map({ db, groupId, uid, groupName, yourName, role, justJoined }: Props) {
+export default function Map({ db, groupId, uid, groupName, yourName, role, justJoined, onLeave }: Props) {
   const map = useRef<MapView>(null);
   const firstFrame = useRef<FirstFrame | undefined>(undefined);
   firstFrame.current ??= frameFirstPins({
@@ -72,6 +74,9 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
   const [greetingVisible, setGreetingVisible] = useState(justJoined === true);
   // The ⋯ menu: Members for everyone, the Owner's Join requests and Invite someone, and the panels they open.
   const [panel, setPanel] = useState<'none' | 'menu' | 'members' | 'invite' | 'joinRequests'>('none');
+  // Leave in flight, and its failure, shown in the menu it was tapped from (spec §7.5).
+  const [leaving, setLeaving] = useState(false);
+  const [leaveError, setLeaveError] = useState<string | null>(null);
 
   useEffect(() => {
     firstFrame.current?.view(view);
@@ -89,6 +94,27 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
   function notNow() {
     if (!banner) return;
     setDismissed((current) => new Set(current).add(banner.uid));
+  }
+
+  /** Leave confirms first (spec §7.5): the run only starts once the Member taps Leave on the dialog. */
+  function confirmLeave() {
+    Alert.alert('Leave this group?', "You'll need a new invite code to come back.", [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Leave', style: 'destructive', onPress: () => void doLeave() },
+    ]);
+  }
+
+  async function doLeave() {
+    setLeaving(true);
+    setLeaveError(null);
+    try {
+      await onLeave();
+    } catch (e) {
+      console.warn('[phases] could not leave the Group', e);
+      setLeaveError("Couldn't leave. Try again.");
+    } finally {
+      setLeaving(false);
+    }
   }
 
   // The recentre button and a tapped member row both move at the recentre zoom (spec §7.4).
@@ -125,7 +151,7 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
       </View>
 
       {/* The ⋯ menu: Members for everyone, the Owner's Join requests (when any are pending) and Invite
-          someone. Leave group arrives in ticket 11. */}
+          someone, and Leave group for everyone but the Owner. */}
       <Pressable
         style={styles.menuButton}
         accessibilityRole="button"
@@ -203,6 +229,18 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
                 <Text style={styles.menuItemLabel}>Invite someone</Text>
               </Pressable>
             )}
+            {!isOwner && (
+              <Pressable
+                style={styles.menuItem}
+                accessibilityRole="button"
+                accessibilityLabel="Leave group"
+                disabled={leaving}
+                onPress={confirmLeave}
+              >
+                <Text style={styles.menuItemLabel}>{leaving ? 'Leaving…' : 'Leave group'}</Text>
+              </Pressable>
+            )}
+            {leaveError && <Text style={styles.menuError}>{leaveError}</Text>}
           </View>
         </>
       )}
@@ -211,6 +249,10 @@ export default function Map({ db, groupId, uid, groupName, yourName, role, justJ
       {panel === 'members' && (
         <View style={StyleSheet.absoluteFill}>
           <Members
+            db={db}
+            groupId={groupId}
+            uid={uid}
+            isOwner={isOwner}
             members={view.members}
             onPick={(position) => {
               if (position) centreOn(position);
@@ -299,6 +341,7 @@ const styles = StyleSheet.create({
   },
   menuItem: { paddingHorizontal: 16, paddingVertical: 12 },
   menuItemLabel: { fontSize: 16 },
+  menuError: { paddingHorizontal: 16, paddingBottom: 12, color: '#b00020' },
   topStack: { position: 'absolute', top: 104, left: 16, right: 16, gap: 12 },
   notice: {
     backgroundColor: 'rgba(255,255,255,0.9)',

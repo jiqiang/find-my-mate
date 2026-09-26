@@ -3,9 +3,9 @@ import { deleteDoc, disableNetwork, getDoc, Timestamp, writeBatch } from 'fireba
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { as, env, modular, sleep, useRulesEnvironment } from './fakes/rules';
-import { addCreateGroup, addMintInvite, joinRequestRef, memberRef } from '../src/groupDocs';
-import { approveJoinRequest, joinGroup } from '../src/session';
-import { startPhases, type Phase, type Phases } from '../src/phases';
+import { addCreateGroup, addJoinMember, addJoinRequest, addMintInvite, joinRequestRef, memberRef } from '../src/groupDocs';
+import { approveJoinRequest, joinGroup, removeMember } from '../src/session';
+import { REMOVED_NOTICE, startPhases, type Phase, type Phases } from '../src/phases';
 
 // Ways the phase decision (ticket 15) could fail, written before src/phases.ts:
 //  1. startPhases does not return straight away in loading, so the app shows a blank or stale screen.
@@ -97,7 +97,7 @@ describe('startPhases', () => {
     });
   });
 
-  it('reaches First run when the stored groupId has no Member document', async () => {
+  it('reaches First run with the notice when the stored groupId has no Member document', async () => {
     await seedGroup();
     await AsyncStorage.setItem('groupId', GID);
     await env.withSecurityRulesDisabled(async (ctx) => {
@@ -105,15 +105,15 @@ describe('startPhases', () => {
     });
 
     const phases = startPhases({ db: as(UID), signIn: signInAs(UID) });
-    expect(await decided(phases)).toEqual({ name: 'firstRun', uid: UID });
+    expect(await decided(phases)).toEqual({ name: 'firstRun', uid: UID, notice: REMOVED_NOTICE });
   });
 
-  it('reaches First run when the stored Group belongs to someone else, so the read is denied', async () => {
+  it('reaches First run with the notice when the stored Group belongs to someone else, so the read is denied', async () => {
     await seedGroup();
     await AsyncStorage.setItem('groupId', GID);
 
     const phases = startPhases({ db: as(STRANGER), signIn: signInAs(STRANGER) });
-    expect(await decided(phases)).toEqual({ name: 'firstRun', uid: STRANGER });
+    expect(await decided(phases)).toEqual({ name: 'firstRun', uid: STRANGER, notice: REMOVED_NOTICE });
   });
 
   it('reaches the error phase carrying the message when sign-in fails', async () => {
@@ -418,7 +418,7 @@ describe('the Waiting phase (spec §7.1 row 2)', () => {
     const back = waitFor(phases, (phase) => phase.name === 'firstRun');
     await deleteDoc(joinRequestRef(as(JOINER), GID, JOINER));
 
-    expect(await back).toEqual({ name: 'firstRun', uid: JOINER });
+    expect(await back).toEqual({ name: 'firstRun', uid: JOINER, notice: REMOVED_NOTICE });
     phases.stop();
   });
 
@@ -445,5 +445,114 @@ describe('the Waiting phase (spec §7.1 row 2)', () => {
       groupName: 'The Smiths',
       ownerName: 'Sam',
     });
+  });
+});
+
+const OWNER_OTHER = 'owner-other';
+
+/**
+ * A Group owned by OWNER_OTHER with UID admitted as a plain Member holding an approved Join request, and
+ * this phone's member storage set as a real Member's would be.
+ */
+async function seedMember(): Promise<void> {
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = modular(ctx);
+    const batch = writeBatch(db);
+    addCreateGroup(batch, db, GID, { ownerUid: OWNER_OTHER, displayName: 'Sam', groupName: 'The Smiths' });
+    addMintInvite(batch, db, GID, CODE, {
+      groupName: 'The Smiths',
+      ownerName: 'Sam',
+      createdBy: OWNER_OTHER,
+      expiresAt: Timestamp.fromDate(new Date(Date.now() + 24 * 60 * 60 * 1000)),
+    });
+    addJoinRequest(batch, db, GID, UID, { displayName: 'Priya', inviteCode: CODE });
+    addJoinMember(batch, db, GID, UID, { displayName: 'Priya' });
+    await batch.commit();
+  });
+  await AsyncStorage.multiSet([
+    ['groupId', GID],
+    ['groupName', 'The Smiths'],
+    ['displayName', 'Priya'],
+    ['role', 'member'],
+  ]);
+}
+
+// Ways a removed Member (ticket 11, spec §7.1 row 4) could fail, written before the code:
+// 41. A stored Group whose own Member document is gone lands on the map instead of First run.
+// 42. It lands on First run without the "no longer in this group" notice.
+// 43. A Member removed while the map is open stays on the map.
+// 44. A failed membership read (offline) is mistaken for removal: silence is never leaving.
+describe('the removed Member (spec §7.1 row 4, ticket 11)', () => {
+  it('lands on First run with the notice when the stored Member document is gone', async () => {
+    await seedMember();
+    // A removal is the batch: the Member, their Position and their Join request go together.
+    await removeMember(as(OWNER_OTHER), GID, UID);
+
+    const phases = startPhases({ db: as(UID), signIn: signInAs(UID) });
+    expect(await decided(phases)).toEqual({ name: 'firstRun', uid: UID, notice: REMOVED_NOTICE });
+    phases.stop();
+  });
+
+  it('lands on First run with the notice when the Owner removes the Member while the map is open', async () => {
+    await seedMember();
+    const phases = startPhases({ db: as(UID), signIn: signInAs(UID) });
+    expect((await decided(phases)).name).toBe('sharing');
+
+    const removed = waitFor(phases, (phase) => phase.name === 'firstRun');
+    await removeMember(as(OWNER_OTHER), GID, UID);
+
+    expect(await removed).toEqual({ name: 'firstRun', uid: UID, notice: REMOVED_NOTICE });
+    phases.stop();
+  });
+
+  it('stays a Member when the membership read fails offline: silence is never leaving', async () => {
+    await seedMember();
+    const db = as(UID);
+    const phases = startPhases({ db, signIn: signInAs(UID) });
+    expect((await decided(phases)).name).toBe('sharing');
+
+    await disableNetwork(db);
+    await sleep(200);
+
+    expect(phases.phase.name).toBe('sharing');
+    phases.stop();
+  });
+});
+
+// Ways Leave (ticket 11, spec §7.5) could fail, written before the code:
+// 45. Leaving moves the phase nowhere, so the phone stays on the map.
+// 46. Leaving lands on First run with the removal notice, not a clean First run.
+// 47. Leaving does not clear the stored Group, so a relaunch is not really First run.
+// 48. The Owner is allowed to leave.
+describe('leaving (spec §7.5, ticket 11)', () => {
+  it('runs the removal batch, clears the stored Group, and lands on plain First run', async () => {
+    await seedMember();
+    const phases = startPhases({ db: as(UID), signIn: signInAs(UID) });
+    expect((await decided(phases)).name).toBe('sharing');
+
+    await phases.leave();
+
+    expect(phases.phase).toEqual({ name: 'firstRun', uid: UID });
+    expect((await getDoc(memberRef(as(OWNER_OTHER), GID, UID))).exists()).toBe(false);
+    expect(await AsyncStorage.getItem('groupId')).toBeNull();
+    phases.stop();
+  });
+
+  it('refuses the Owner leaving, leaving them on the map', async () => {
+    await seedGroup();
+    await AsyncStorage.multiSet([
+      ['groupId', GID],
+      ['groupName', 'The Smiths'],
+      ['displayName', 'Sam'],
+      ['role', 'owner'],
+    ]);
+    const phases = startPhases({ db: as(UID), signIn: signInAs(UID) });
+    expect((await decided(phases)).name).toBe('sharing');
+
+    await expect(phases.leave()).rejects.toThrow();
+
+    expect(phases.phase.name).toBe('sharing');
+    expect((await getDoc(memberRef(as(UID), GID, UID))).exists()).toBe(true);
+    phases.stop();
   });
 });

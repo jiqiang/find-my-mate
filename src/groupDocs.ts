@@ -142,6 +142,18 @@ export function addJoinMember(
 }
 
 /**
+ * Adds Remove-from-group / Leave's three deletions to `batch` (spec §5): the Member, their Position and
+ * their Join request. Deleting the request is the load-bearing one: an approved request left behind would
+ * let a removed phone admit itself straight back in. The Owner sends this for anyone else; a Member sends
+ * it for themselves, which is Leave. Callers commit once, so a phone is never half in and half out.
+ */
+export function addRemoval(batch: WriteBatch, db: Firestore, gid: string, uid: string): void {
+  batch.delete(memberRef(db, gid, uid));
+  batch.delete(positionRef(db, gid, uid));
+  batch.delete(joinRequestRef(db, gid, uid));
+}
+
+/**
  * Adds a minted Invite code to `batch` (spec §3, §5): the `invites/{code}` document, the Group's
  * `activeInviteCode` pointer, and — when there was a previous code — the deletion of the old document.
  * Order matters as the spec states it: the replacement is written first, the pointer moves next, and the
